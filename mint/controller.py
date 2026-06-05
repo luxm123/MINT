@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import random
 from pathlib import Path
@@ -24,6 +25,8 @@ SUPPORTED_BASELINES = {
     "mint_offline",
     "mint_offline_unlimited",
     "mint_full",
+    "mint_markov_offline",
+    "mint_markov_full",
 }
 
 
@@ -49,6 +52,7 @@ class MintController:
         self.summary_path = self.output_dir / "summary.json"
         self._hot_until: dict[str, float] = {}
         self._warmups: set[str] = set()
+        self.planner_type = self._planner_type_for_baseline()
 
     def run(self, repetitions: int) -> dict[str, Any]:
         summaries = [self.run_once(index) for index in range(repetitions)]
@@ -61,7 +65,8 @@ class MintController:
     def run_once(self, index: int) -> dict[str, Any]:
         run_id = new_id("run")
         context = {"branch": "left" if index % 2 == 0 else "right"}
-        intents = plan_intents(self.dag, self.config)
+        planner_config = self._planner_config()
+        intents = plan_intents(self.dag, planner_config)
         selected_nodes = self._resolve_path(context)
         start = monotonic_sec()
         cold_count = 0
@@ -108,6 +113,7 @@ class MintController:
             run_id=run_id,
             dag=self.dag.name,
             baseline=self.baseline,
+            planner_type=self.planner_type,
             latency_ms=latency_ms,
             cold_start_count=cold_count,
             warmup_count=warmup_count,
@@ -116,7 +122,15 @@ class MintController:
         return summary_event.to_dict()
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float) -> int:
-        if self.baseline in {"periodic", "independent", "static_dag", "static_dag_unlimited", "mint_offline", "mint_offline_unlimited"}:
+        if self.baseline in {
+            "periodic",
+            "independent",
+            "static_dag",
+            "static_dag_unlimited",
+            "mint_offline",
+            "mint_offline_unlimited",
+            "mint_markov_offline",
+        }:
             actions = self._static_baseline_actions(intents)
         else:
             call_probability = {node: (1.0 if node in selected_nodes else 0.0) for node in self.dag.nodes}
@@ -171,6 +185,18 @@ class MintController:
             count += 1
         return count
 
+    def _planner_type_for_baseline(self) -> str:
+        if self.baseline in {"mint_markov_offline", "mint_markov_full"}:
+            return "markov"
+        if self.baseline in {"mint_offline", "mint_full"}:
+            return "heuristic"
+        return self.config.get("planner", {}).get("type", "heuristic")
+
+    def _planner_config(self) -> dict[str, Any]:
+        planner_config = copy.deepcopy(self.config)
+        planner_config.setdefault("planner", {})["type"] = self.planner_type
+        return planner_config
+
     def _static_baseline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
         ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
         unlimited = self.baseline in {"static_dag_unlimited", "mint_offline_unlimited", "periodic", "independent"}
@@ -211,7 +237,7 @@ class MintController:
     def _write_runs_csv(self, summaries: list[dict[str, Any]]) -> None:
         ensure_dir(self.runs_path.parent)
         with self.runs_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["run_id", "dag", "baseline", "latency_ms", "cold_start_count", "warmup_count", "status"])
+            writer = csv.DictWriter(fh, fieldnames=["run_id", "dag", "baseline", "planner_type", "latency_ms", "cold_start_count", "warmup_count", "status"])
             writer.writeheader()
             for row in summaries:
                 writer.writerow({key: row.get(key) for key in writer.fieldnames})

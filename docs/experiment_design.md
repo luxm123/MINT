@@ -11,7 +11,11 @@ Online scheduling observes runtime state and converts intents into actions:
 - `cancel`: discard the intent because it is not useful.
 - `replace`: drop a lower-gain candidate when the budget is full.
 
-The first implementation is heuristic. It estimates stage timing from DAG depth, call probability from branch structure, cold-start risk from simple platform defaults, and criticality from downstream count. This is the intended extension point for a future Markov Policy Planner that optimizes expected value over runtime states.
+The original implementation is heuristic. It estimates stage timing from DAG depth, call probability from branch structure, cold-start risk from simple platform defaults, and criticality from downstream count. This remains useful as a lightweight prototype and baseline.
+
+The Markov planner implements the paper-oriented offline policy analyzer. It defines a finite-horizon controlled Markov model over DAG frontier, HOT/COLD state with retention buckets, completed functions, branch path, and time bucket. Actions are sets of functions to warm, constrained by warmup budget `B`. Transitions model real function calls, cold-start penalties, warmup effects, retention expiration, branch probability, fanout, and join readiness. Rewards are negative costs that include expected cold-start penalty, path penalty, warmup cost, wasted warmup penalty, and missed warmup penalty.
+
+The runtime scheduler can consume intents from either planner. `mint_full` is heuristic intents plus runtime scheduling. `mint_markov_full` is Markov intents plus runtime scheduling. During paper development, report both; after validation, `mint_markov_full` can become the primary MINT result.
 
 Measured metrics include end-to-end latency, latency percentiles, cold-start rate, total warmups, useful warmups, wasted warmups, missed warmups, useful warmup ratio, and scheduler action counts.
 
@@ -21,6 +25,7 @@ Formal experiments should vary:
 
 - DAG: `chain`, `fanout`, `branch`, `join`.
 - Baseline: `no_warmup`, `static_dag`, `mint_offline`, `mint_full`.
+- Markov variants: `mint_markov_offline`, `mint_markov_full`.
 - Warmup budget: usually `1`, `2`, and `3`.
 - Repetitions: start with `10` for AWS pilot data, then increase if variance is high.
 
@@ -69,6 +74,30 @@ python scripts/prepare_paper_tables.py \
 ```
 
 The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, and budget sensitivity. They also include MINT warmup reduction relative to `static_dag` and `mint_offline`, plus MINT latency reduction relative to `no_warmup`.
+
+## Planner Configuration
+
+Use the heuristic planner:
+
+```yaml
+planner:
+  type: heuristic
+```
+
+Use the Markov policy analyzer:
+
+```yaml
+planner:
+  type: markov
+  horizon: 5
+  warmup_cost: 0.1
+  cold_start_penalty_weight: 1.0
+  wasted_warmup_penalty_weight: 0.2
+  missed_warmup_penalty_weight: 0.5
+  retention_bucket_sec: 60
+```
+
+The current analyzer is intended for `chain`, `fanout`, `branch`, and `join`. It enumerates states and actions directly, so it is not yet suitable for large DAGs without state abstraction or pruning.
 
 ## Metric Notes
 

@@ -53,6 +53,7 @@ class SchedulerDecision(EventBase):
 class WorkflowRunSummary(EventBase):
     dag: str = ""
     baseline: str = ""
+    planner_type: str = "heuristic"
     latency_ms: float = 0.0
     cold_start_count: int = 0
     warmup_count: int = 0

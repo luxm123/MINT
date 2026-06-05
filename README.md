@@ -140,8 +140,36 @@ Supported baselines are:
 - `mint_offline`
 - `mint_offline_unlimited`
 - `mint_full`
+- `mint_markov_offline`
+- `mint_markov_full`
 
 `mint_full` uses offline intents plus the runtime scheduler. For fair comparison, `static_dag`, `mint_offline`, and `mint_full` all obey `experiment.warmup_budget`. The `_unlimited` variants are available only when you intentionally want an unbounded static/offline comparison.
+
+`mint_offline` and `mint_full` preserve the original heuristic planner behavior. `mint_markov_offline` uses the Markov policy analyzer without runtime adaptation, while `mint_markov_full` combines Markov-generated intents with runtime-adaptive scheduling.
+
+## Planner Selection
+
+Use the lightweight heuristic planner:
+
+```yaml
+planner:
+  type: heuristic
+```
+
+Use the paper-oriented finite-horizon Markov analyzer:
+
+```yaml
+planner:
+  type: markov
+  horizon: 5
+  warmup_cost: 0.1
+  cold_start_penalty_weight: 1.0
+  wasted_warmup_penalty_weight: 0.2
+  missed_warmup_penalty_weight: 0.5
+  retention_bucket_sec: 60
+```
+
+For paper experiments, report both `mint_full` and `mint_markov_full` during the transition period. Once the Markov analyzer is validated against AWS data, `mint_markov_full` can be used as the main MINT result.
 
 ## Metrics
 
@@ -155,3 +183,5 @@ Supported baselines are:
 ## Heuristic Components
 
 The current offline planner uses a heuristic approximation of a future Markov Policy Planner. It estimates stage timing, validity windows, criticality, call probability, cold-start risk, and downstream benefit. The interfaces are stable so the planner can later be replaced with a true Markov decision policy optimizer.
+
+`mint/markov_policy.py` now provides that finite-horizon Markov analyzer for the small DAGs used in the current experiments. It enumerates budget-constrained warmup actions, applies branch probabilities and retention buckets, and converts the resulting policy into warmup intents. It is intentionally small-DAG oriented rather than a production-scale state-space optimizer.

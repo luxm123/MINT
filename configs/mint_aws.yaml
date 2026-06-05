@@ -15,6 +15,17 @@ experiment:
   dry_run: true
   output_dir: results/default
 
+planner:
+  # type can be heuristic or markov. Heuristic remains the lightweight prototype;
+  # markov enables the finite-horizon offline policy analyzer.
+  type: markov
+  horizon: 5
+  warmup_cost: 0.1
+  cold_start_penalty_weight: 1.0
+  wasted_warmup_penalty_weight: 0.2
+  missed_warmup_penalty_weight: 0.5
+  retention_bucket_sec: 60
+
 platform:
   retention_probe_delays_sec: [30, 60, 120, 180, 300, 600]
   default_retention_sec: 300

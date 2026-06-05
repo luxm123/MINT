@@ -53,6 +53,7 @@ def main() -> int:
     )
     summary = controller.run(int(exp.get("repetitions", 1)))
     print(f"dry_run={dry_run}")
+    print(f"planner_type={controller.planner_type}")
     print(f"output_dir={controller.output_dir}")
     print(f"summary={summary}")
     return 0

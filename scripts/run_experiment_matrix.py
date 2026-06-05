@@ -26,6 +26,7 @@ SUMMARY_FIELDS = [
     "timestamp",
     "dag",
     "baseline",
+    "planner_type",
     "budget",
     "repetitions",
     "output_dir",
@@ -126,6 +127,7 @@ def _run_one(
         "timestamp": timestamp,
         "dag": dag_name,
         "baseline": baseline,
+        "planner_type": controller.planner_type,
         "budget": budget,
         "repetitions": repetitions,
         "output_dir": str(output_dir),
@@ -162,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
         "cooldown_sec": args.cooldown_sec,
         "randomize_order": args.randomize_order,
         "dry_run": dry_run,
+        "planner_type": base_config.get("planner", {}).get("type", "heuristic"),
         "output_root": str(output_root),
         "run_count": len(configs),
     }

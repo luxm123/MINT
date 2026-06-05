@@ -36,9 +36,11 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
     missed_warmup = len(cold_reals & covered)
     uncovered_cold_start = len(cold_reals - covered)
     action_counts = Counter(e.get("action") for e in decision_events)
+    planner_types = sorted({e.get("planner_type") for e in summary_events if e.get("planner_type")})
 
     return {
         "workflow_runs": len(summary_events),
+        "planner_type": planner_types[0] if len(planner_types) == 1 else ",".join(planner_types),
         "end_to_end_latency_ms_avg": round(float(np.mean(latencies)), 3) if latencies else 0.0,
         "p50_latency_ms": _percentile(latencies, 50),
         "p95_latency_ms": _percentile(latencies, 95),

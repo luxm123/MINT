@@ -27,7 +27,7 @@ def _node_call_probability(dag: WorkflowDAG, node: str) -> float:
     return 1.0
 
 
-def plan_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[WarmupIntent]:
+def plan_heuristic_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[WarmupIntent]:
     """Create offline warmup intents.
 
     This heuristic is a clear replacement point for a future Markov Policy Planner.
@@ -70,3 +70,15 @@ def plan_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[WarmupIntent]
         )
 
     return sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+
+
+def plan_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[WarmupIntent]:
+    planner_type = config.get("planner", {}).get("type", "heuristic")
+    if planner_type == "markov":
+        from mint.markov_policy import MarkovPolicyAnalyzer
+
+        analyzer = MarkovPolicyAnalyzer(dag, config, budget=int(config.get("experiment", {}).get("warmup_budget", 1)))
+        return analyzer.generate_intents()
+    if planner_type != "heuristic":
+        raise ValueError(f"Unsupported planner.type: {planner_type}")
+    return plan_heuristic_intents(dag, config)
