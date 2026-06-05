@@ -54,6 +54,21 @@ Repeat for `mint-f2` through `mint-f5`, or update the config to match your deplo
 python scripts/run_mint_experiment.py --config configs/mint_aws.yaml --dag chain --baseline mint_full --repetitions 2 --dry-run
 ```
 
+For a matrix smoke test:
+
+```bash
+python scripts/run_experiment_matrix.py \
+  --config configs/mint_aws.yaml \
+  --dags chain \
+  --baselines no_warmup static_dag mint_offline mint_full \
+  --budgets 2 \
+  --repetitions 2 \
+  --cooldown-sec 1 \
+  --randomize-order \
+  --dry-run \
+  --output-root results/dryrun_matrix_test
+```
+
 ## 8. Run Real Experiment
 
 ```bash
@@ -61,6 +76,23 @@ python scripts/run_mint_experiment.py --config configs/mint_aws.yaml --dag chain
 ```
 
 Real AWS calls are refused unless `--confirm-real-run` is present and dry-run is disabled in the config.
+
+Recommended first formal matrix:
+
+```bash
+python scripts/run_experiment_matrix.py \
+  --config configs/mint_aws_real.yaml \
+  --dags chain fanout branch join \
+  --baselines no_warmup static_dag mint_offline mint_full \
+  --budgets 1 2 3 \
+  --repetitions 10 \
+  --cooldown-sec 120 \
+  --randomize-order \
+  --confirm-real-run \
+  --output-root results/aws_matrix_main
+```
+
+Real AWS experiments may create Lambda, CloudWatch Logs, and data transfer costs. Keep `--dry-run` for local validation and use `--confirm-real-run` only when you are ready to spend real AWS resources.
 
 ## 9. Download Results
 
@@ -73,6 +105,16 @@ scp -r ec2-user@EC2_HOST:/path/to/MINT/results ./results
 ```bash
 python scripts/summarize_results.py --results-dir results
 ```
+
+For matrix runs, use the generated `summary_matrix.csv` directly or prepare paper tables:
+
+```bash
+python scripts/prepare_paper_tables.py \
+  --matrix-csv results/aws_matrix_main/summary_matrix.csv \
+  --output-dir results/aws_matrix_main/paper_tables
+```
+
+`--randomize-order` avoids always giving the same baseline first access to freshly cold Lambda environments. `--cooldown-sec` inserts a pause between configurations so retained Lambda execution environments are less likely to leak across treatments.
 
 ## 11. Troubleshooting
 
