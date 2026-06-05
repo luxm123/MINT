@@ -27,7 +27,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     end_time = _now()
     duration_ms = round((time.time() - start) * 1000.0, 3)
     function_name = event.get("function_name") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "unknown")
-    invocation_type = event.get("invocation_type", "real")
+    invocation_type = event.get("invocation_type") or event.get("type", "real")
     result = {
         "function_name": function_name,
         "run_id": event.get("run_id", ""),
@@ -38,3 +38,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "duration_ms": duration_ms,
     }
     return json.loads(json.dumps(result))
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    return handler(event, context)

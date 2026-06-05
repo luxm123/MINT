@@ -2,7 +2,7 @@
 
 MINT is a Python experiment framework for serverless DAG warmup research. It separates offline warmup intent generation from online runtime scheduling, so a controller can execute, delay, cancel, or replace warmup actions based on observed state.
 
-The first version is intentionally practical: it provides a local dry-run path, an AWS Lambda invocation wrapper, baseline modes, JSONL event logs, and summary metrics for end-to-end latency, cold starts, useful warmups, wasted warmups, missed warmups, and scheduler actions.
+The first version is intentionally practical: it provides a local dry-run path, an AWS Lambda invocation wrapper, baseline modes, JSONL event logs, and summary metrics for end-to-end latency, cold starts, useful warmups, wasted warmups, missed warmups, uncovered cold starts, and scheduler actions.
 
 ## Project Structure
 
@@ -69,10 +69,21 @@ Supported baselines are:
 - `periodic`
 - `independent`
 - `static_dag`
+- `static_dag_unlimited`
 - `mint_offline`
+- `mint_offline_unlimited`
 - `mint_full`
 
-`mint_full` uses offline intents plus the runtime scheduler. Other warmup baselines use simpler intent execution policies for comparison.
+`mint_full` uses offline intents plus the runtime scheduler. For fair comparison, `static_dag`, `mint_offline`, and `mint_full` all obey `experiment.warmup_budget`. The `_unlimited` variants are available only when you intentionally want an unbounded static/offline comparison.
+
+## Metrics
+
+- `cold_start_count`: real invocations that observed a cold start.
+- `missed_warmup`: cold real invocations for functions that had a warmup event or warmup intent in that workflow run, but were still cold.
+- `uncovered_cold_start`: cold real invocations with no warmup event and no warmup intent coverage. For `no_warmup`, `missed_warmup` is expected to be `0` and cold starts appear here instead.
+- `useful_warmup`: warmup invocations that covered a function later called in the same workflow run.
+- `wasted_warmup`: warmup invocations that did not cover a later real call in the same workflow run.
+- `useful_warmup_ratio`: `useful_warmup / total_warmup`.
 
 ## Heuristic Components
 

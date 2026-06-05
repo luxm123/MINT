@@ -21,6 +21,7 @@ def test_scheduler_can_produce_execute_delay_cancel_replace():
     assert "execute" in action_types
     assert "replace" in action_types
     assert "cancel" in action_types
+    assert sum(1 for action in actions if action.action_type == "execute") == 1
 
     delayed = schedule_intents(intents, {"now_sec": -999.0, "call_probability": {}, "hot_until": {}}, 10, config)
     assert "delay" in {action.action_type for action in delayed}

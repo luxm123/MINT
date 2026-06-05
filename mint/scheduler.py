@@ -61,8 +61,9 @@ def schedule_intents(
             candidates.append(WarmupAction("execute", intent, gain, "positive_gain_within_budget"))
 
     budget = max(0, int(budget))
-    selected = sorted(candidates, key=lambda item: item.gain, reverse=True)[:budget]
-    overflow = sorted(candidates, key=lambda item: item.gain, reverse=True)[budget:]
+    ranked_candidates = sorted(candidates, key=lambda item: item.gain, reverse=True)
+    selected = ranked_candidates[:budget]
+    overflow = ranked_candidates[budget:]
     for action in overflow:
         if scheduler_cfg.get("enable_replace", True):
             non_candidates.append(WarmupAction("replace", action.intent, action.gain, "replaced_by_higher_gain_candidate"))

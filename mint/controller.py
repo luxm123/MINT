@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import random
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -11,12 +10,21 @@ from mint.aws_client import invoke_lambda
 from mint.events import InvocationEvent, SchedulerDecision, WarmupEvent, WorkflowRunSummary
 from mint.intent_planner import WarmupIntent, plan_intents
 from mint.metrics import compute_summary
-from mint.scheduler import schedule_intents
+from mint.scheduler import WarmupAction, schedule_intents
 from mint.utils import append_jsonl, ensure_dir, monotonic_sec, new_id
 from mint.workloads import WorkflowDAG, get_workload
 
 
-SUPPORTED_BASELINES = {"no_warmup", "periodic", "independent", "static_dag", "mint_offline", "mint_full"}
+SUPPORTED_BASELINES = {
+    "no_warmup",
+    "periodic",
+    "independent",
+    "static_dag",
+    "static_dag_unlimited",
+    "mint_offline",
+    "mint_offline_unlimited",
+    "mint_full",
+}
 
 
 class MintController:
@@ -108,11 +116,8 @@ class MintController:
         return summary_event.to_dict()
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float) -> int:
-        if self.baseline in {"periodic", "independent", "static_dag", "mint_offline"}:
-            actions = [
-                type("StaticAction", (), {"action_type": "execute", "intent": intent, "gain": intent.offline_gain, "action_reason": self.baseline})()
-                for intent in intents
-            ]
+        if self.baseline in {"periodic", "independent", "static_dag", "static_dag_unlimited", "mint_offline", "mint_offline_unlimited"}:
+            actions = self._static_baseline_actions(intents)
         else:
             call_probability = {node: (1.0 if node in selected_nodes else 0.0) for node in self.dag.nodes}
             runtime_state = {
@@ -165,6 +170,19 @@ class MintController:
             append_jsonl(self.events_path, warmup_event.to_dict())
             count += 1
         return count
+
+    def _static_baseline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        unlimited = self.baseline in {"static_dag_unlimited", "mint_offline_unlimited", "periodic", "independent"}
+        budget = len(ranked) if unlimited else int(self.config.get("experiment", {}).get("warmup_budget", 1))
+        budget = max(0, budget)
+        actions: list[WarmupAction] = []
+        for index, intent in enumerate(ranked):
+            if index < budget:
+                actions.append(WarmupAction("execute", intent, intent.offline_gain, f"{self.baseline}_within_budget"))
+            else:
+                actions.append(WarmupAction("replace", intent, intent.offline_gain, f"{self.baseline}_budget_exceeded"))
+        return actions
 
     def _resolve_path(self, context: dict[str, Any]) -> list[str]:
         ready = list(self.dag.entry_nodes)
