@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+results/
+*.egg-info/
+.coverage
+.env
+.aws/
+aws_credentials*
+credentials
+config

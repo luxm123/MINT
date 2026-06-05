@@ -1,0 +1,28 @@
+aws:
+  region: us-east-1
+  lambda_functions:
+    f1: mint-f1
+    f2: mint-f2
+    f3: mint-f3
+    f4: mint-f4
+    f5: mint-f5
+
+experiment:
+  dag: chain
+  baseline: mint_full
+  repetitions: 3
+  warmup_budget: 2
+  dry_run: true
+  output_dir: results/default
+
+platform:
+  retention_probe_delays_sec: [30, 60, 120, 180, 300, 600]
+  default_retention_sec: 300
+  default_cold_start_ms: 800
+  default_warm_duration_ms: 100
+
+scheduler:
+  enable_delay: true
+  enable_cancel: true
+  enable_replace: true
+  gain_threshold: 0.0
