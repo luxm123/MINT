@@ -39,6 +39,7 @@ def test_experiment_matrix_dry_run_generates_summary(tmp_path):
     rows = pd.read_csv(matrix_csv)
     assert len(rows) == 2
     assert "uncovered_cold_start" in rows.columns
+    assert "unserved_intent_cold_start" in rows.columns
     assert "effective_planner" in rows.columns
     assert set(rows["baseline"]) == {"no_warmup", "static_dag"}
     planners = dict(zip(rows["baseline"], rows["effective_planner"]))
@@ -229,6 +230,7 @@ def test_prepare_paper_tables_from_small_matrix_csv(tmp_path):
         assert path.exists()
     warmup = pd.read_csv(paths["warmup"])
     mint = warmup[warmup["baseline"] == "mint_markov_full"].iloc[0]
+    assert "unserved_intent_cold_start" in warmup.columns
     assert mint["mint_vs_static_dag_warmup_reduction_ratio"] == 0.5
     assert mint["mint_vs_offline_warmup_reduction_ratio"] == 0.5
     assert mint["mint_vs_no_warmup_latency_reduction_ratio"] == 0.5
@@ -263,6 +265,7 @@ def test_delay_shift_dry_run_generates_delay_and_outputs(tmp_path):
     assert (output_dir / "delay_analysis.csv").exists()
     analysis = pd.read_csv(output_dir / "delay_analysis.csv")
     assert int(analysis["delay_count"].iloc[0]) > 0
+    assert "unserved_intent_cold_start" in analysis.columns
 
 
 def test_delay_shift_refuses_real_run_without_confirm(tmp_path):

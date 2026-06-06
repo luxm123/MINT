@@ -50,6 +50,19 @@ def _ensure_effective_planner(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _ensure_unserved_intent_metric(df: pd.DataFrame) -> pd.DataFrame:
+    if "unserved_intent_cold_start" in df.columns:
+        return df
+    df = df.copy()
+    warnings.warn(
+        "summary_matrix.csv has no unserved_intent_cold_start column; "
+        "using legacy missed_warmup as a compatibility fill.",
+        stacklevel=2,
+    )
+    df["unserved_intent_cold_start"] = df.get("missed_warmup", np.nan)
+    return df
+
+
 def _prepare_variability(df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "dag",
@@ -110,7 +123,7 @@ def _prepare_variability(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_tables(matrix_csv: str | Path, output_dir: str | Path) -> dict[str, Path]:
-    df = _ensure_effective_planner(pd.read_csv(matrix_csv))
+    df = _ensure_unserved_intent_metric(_ensure_effective_planner(pd.read_csv(matrix_csv)))
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -138,6 +151,7 @@ def prepare_tables(matrix_csv: str | Path, output_dir: str | Path) -> dict[str, 
             useful_warmup=("useful_warmup", "sum"),
             wasted_warmup=("wasted_warmup", "sum"),
             missed_warmup=("missed_warmup", "sum"),
+            unserved_intent_cold_start=("unserved_intent_cold_start", "sum"),
             uncovered_cold_start=("uncovered_cold_start", "sum"),
             useful_warmup_ratio=("useful_warmup_ratio", "mean"),
             end_to_end_latency_ms_avg=("end_to_end_latency_ms_avg", "mean"),
@@ -223,6 +237,7 @@ def prepare_tables(matrix_csv: str | Path, output_dir: str | Path) -> dict[str, 
             total_warmup=("total_warmup", "sum"),
             wasted_warmup=("wasted_warmup", "sum"),
             missed_warmup=("missed_warmup", "sum"),
+            unserved_intent_cold_start=("unserved_intent_cold_start", "sum"),
             useful_warmup_ratio=("useful_warmup_ratio", "mean"),
             execute_count=("execute_count", "sum"),
             cancel_count=("cancel_count", "sum"),
@@ -248,6 +263,8 @@ def prepare_tables(matrix_csv: str | Path, output_dir: str | Path) -> dict[str, 
                             "latency_reduction_ratio": _safe_reduction(pd.Series([ref["average_latency"]]), pd.Series([mint_row["average_latency"]])).iloc[0],
                             "warmup_reduction_ratio": _safe_reduction(pd.Series([ref["total_warmup"]]), pd.Series([mint_row["total_warmup"]])).iloc[0],
                             "cold_start_rate_reduction_ratio": _safe_reduction(pd.Series([ref["cold_start_rate"]]), pd.Series([mint_row["cold_start_rate"]])).iloc[0],
+                            "mint_unserved_intent_cold_start": mint_row["unserved_intent_cold_start"],
+                            "reference_unserved_intent_cold_start": ref["unserved_intent_cold_start"],
                         }
                     )
     improvement = pd.DataFrame(
@@ -259,6 +276,8 @@ def prepare_tables(matrix_csv: str | Path, output_dir: str | Path) -> dict[str, 
             "latency_reduction_ratio",
             "warmup_reduction_ratio",
             "cold_start_rate_reduction_ratio",
+            "mint_unserved_intent_cold_start",
+            "reference_unserved_intent_cold_start",
         ],
     )
     variability = _prepare_variability(df)

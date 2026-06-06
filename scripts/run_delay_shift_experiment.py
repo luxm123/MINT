@@ -214,6 +214,7 @@ def run_delay_shift(config: dict[str, Any], args: argparse.Namespace, dry_run: b
                 "upstream_delay_ms",
                 "delay_count",
                 "missed_warmup",
+                "unserved_intent_cold_start",
                 "cold_start_count",
                 "end_to_end_latency_ms_avg",
             ],
@@ -226,6 +227,7 @@ def run_delay_shift(config: dict[str, Any], args: argparse.Namespace, dry_run: b
                 "upstream_delay_ms": args.upstream_delay_ms,
                 "delay_count": summary.get("delay_count", 0),
                 "missed_warmup": summary.get("missed_warmup", 0),
+                "unserved_intent_cold_start": summary.get("unserved_intent_cold_start", 0),
                 "cold_start_count": summary.get("cold_start_count", 0),
                 "end_to_end_latency_ms_avg": summary.get("end_to_end_latency_ms_avg", 0),
             }

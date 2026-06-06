@@ -73,7 +73,7 @@ python scripts/prepare_paper_tables.py \
   --output-dir results/aws_matrix_main/paper_tables
 ```
 
-The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, budget sensitivity, overall results, MINT improvement ratios, and run-level variability. Improvement ratios prefer `mint_markov_full` over `mint_full`, and prefer `mint_markov_offline` over `mint_offline` as the offline reference.
+The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, budget sensitivity, overall results, MINT improvement ratios, and run-level variability. Improvement ratios prefer `mint_markov_full` over `mint_full`, and prefer `mint_markov_offline` over `mint_offline` as the offline reference. Paper tables use `effective_planner` for method labeling; `planner_type` is retained only as configuration provenance.
 
 ## Delay-Shift Supplemental Experiment
 
@@ -117,6 +117,6 @@ The current analyzer is intended for `chain`, `fanout`, `branch`, and `join`. It
 
 ## Metric Notes
 
-`uncovered_cold_start` counts cold starts without any warmup event or intent coverage. `missed_warmup` counts cold starts where the workflow had a warmup event or scheduler intent for that function but the real invocation was still cold. `wasted_warmup` currently means a warmup event that was not on the realized workflow path; already-HOT no-benefit warmups are not separated yet.
+`missed_warmup` counts cold starts after an executed warmup event for the same function and workflow run. `unserved_intent_cold_start` counts cold starts where a warmup intent or scheduler candidate existed but was not executed because of budget pressure, `replace`, `cancel`, or delay beyond the call. `uncovered_cold_start` counts cold starts without any warmup event or intent coverage. `wasted_warmup` currently means a warmup event that was not on the realized workflow path; already-HOT no-benefit warmups are not separated yet.
 
 AWS real runs can create cloud charges. All smoke tests should run with `--dry-run`; matrix real runs require `--confirm-real-run`.

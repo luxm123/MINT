@@ -33,7 +33,8 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
     intended = {(e.get("run_id"), e.get("logical_name")) for e in decision_events}
     covered = warmed | intended
     cold_reals = {(e.get("run_id"), e.get("logical_name")) for e in invocation_events if e.get("cold_start")}
-    missed_warmup = len(cold_reals & covered)
+    missed_warmup = len(cold_reals & warmed)
+    unserved_intent_cold_start = len(cold_reals & (intended - warmed))
     uncovered_cold_start = len(cold_reals - covered)
     action_counts = Counter(e.get("action") for e in decision_events)
     planner_types = sorted({e.get("planner_type") for e in summary_events if e.get("planner_type")})
@@ -52,6 +53,7 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
         "useful_warmup": useful_warmup,
         "wasted_warmup": wasted_warmup,
         "missed_warmup": missed_warmup,
+        "unserved_intent_cold_start": unserved_intent_cold_start,
         "uncovered_cold_start": uncovered_cold_start,
         "useful_warmup_ratio": round(useful_warmup / total_warmup, 6) if total_warmup else 0.0,
         "execute_count": action_counts.get("execute", 0),

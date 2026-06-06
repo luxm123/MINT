@@ -116,7 +116,7 @@ python scripts/prepare_paper_tables.py \
 
 `--randomize-order` avoids always giving the same baseline first access to freshly cold Lambda environments. `--cooldown-sec` inserts a pause between configurations so retained Lambda execution environments are less likely to leak across treatments.
 
-Use `mint_markov_full` as the formal MINT baseline and keep `mint_full` as a heuristic ablation. The paper table step also writes `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`.
+Use `mint_markov_full` as the formal MINT baseline and keep `mint_full` as a heuristic ablation. The paper table step also writes `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`. These tables use `effective_planner` for paper-facing labels; `planner_type` remains provenance for the run configuration.
 
 Run the delay-shift supplemental experiment when you need evidence for the Delay mechanism:
 
@@ -131,6 +131,8 @@ python scripts/run_delay_shift_experiment.py \
 ```
 
 Main matrix results with `delay_count=0` should not be used to claim Delay has been fully validated.
+
+Interpret warmup miss metrics carefully: `missed_warmup` means an executed warmup failed to prevent a cold start; `unserved_intent_cold_start` means an intent existed but was not executed; `uncovered_cold_start` means there was no intent coverage at all.
 
 ## 11. Troubleshooting
 

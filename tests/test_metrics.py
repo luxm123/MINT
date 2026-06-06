@@ -22,6 +22,7 @@ def test_metrics_compute_summary_from_events(tmp_path):
     assert summary["useful_warmup"] == 1
     assert summary["wasted_warmup"] == 1
     assert summary["missed_warmup"] == 1
+    assert summary["unserved_intent_cold_start"] == 0
     assert summary["uncovered_cold_start"] == 0
     assert summary["execute_count"] == 1
     assert summary["cancel_count"] == 1
@@ -38,10 +39,11 @@ def test_no_warmup_cold_starts_are_uncovered_not_missed(tmp_path):
     summary = compute_summary(events_path)
     assert summary["cold_start_count"] == 2
     assert summary["missed_warmup"] == 0
+    assert summary["unserved_intent_cold_start"] == 0
     assert summary["uncovered_cold_start"] == 2
 
 
-def test_cold_start_with_intent_counts_as_missed(tmp_path):
+def test_cold_start_with_unserved_intent_counts_separately(tmp_path):
     events_path = tmp_path / "events.jsonl"
     events = [
         {"event_type": "scheduler_decision", "run_id": "r1", "logical_name": "f1", "action": "replace"},
@@ -50,5 +52,6 @@ def test_cold_start_with_intent_counts_as_missed(tmp_path):
     ]
     events_path.write_text("\n".join(json.dumps(item) for item in events), encoding="utf-8")
     summary = compute_summary(events_path)
-    assert summary["missed_warmup"] == 1
+    assert summary["missed_warmup"] == 0
+    assert summary["unserved_intent_cold_start"] == 1
     assert summary["uncovered_cold_start"] == 0

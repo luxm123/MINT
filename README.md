@@ -122,7 +122,7 @@ python scripts/prepare_paper_tables.py \
   --output-dir results/dryrun_matrix_test/paper_tables
 ```
 
-This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_action_counts.csv`, `table_budget_sensitivity.csv`, `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`.
+This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_action_counts.csv`, `table_budget_sensitivity.csv`, `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`. Paper tables use `effective_planner` for method labeling; `planner_type` is retained only as configuration provenance.
 
 ## Delay-Shift Experiment
 
@@ -190,8 +190,9 @@ For paper experiments, use `mint_markov_full` as the formal MINT result. Keep `m
 ## Metrics
 
 - `cold_start_count`: real invocations that observed a cold start.
-- `missed_warmup`: cold real invocations for functions that had a warmup event or warmup intent in that workflow run, but were still cold.
-- `uncovered_cold_start`: cold real invocations with no warmup event and no warmup intent coverage. For `no_warmup`, `missed_warmup` is expected to be `0` and cold starts appear here instead.
+- `missed_warmup`: cold real invocations for functions that had an executed warmup event in that workflow run, but were still cold at real invocation time.
+- `unserved_intent_cold_start`: cold real invocations for functions that had a warmup intent or scheduler candidate, but the warmup was not executed because of budget pressure, `replace`, `cancel`, or delay beyond the call.
+- `uncovered_cold_start`: cold real invocations with no warmup event and no warmup intent coverage. For `no_warmup`, `missed_warmup` and `unserved_intent_cold_start` are expected to be `0`; cold starts appear here instead.
 - `useful_warmup`: warmup invocations marked useful by the current controller because the function is on the realized workflow path.
 - `wasted_warmup`: warmup invocations not marked useful, including branch-path warmups that are never called. The current implementation does not yet distinguish already-HOT no-benefit warmups as a separate field.
 - `useful_warmup_ratio`: `useful_warmup / total_warmup`.

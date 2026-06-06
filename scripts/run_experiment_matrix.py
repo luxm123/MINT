@@ -42,6 +42,7 @@ SUMMARY_FIELDS = [
     "useful_warmup",
     "wasted_warmup",
     "missed_warmup",
+    "unserved_intent_cold_start",
     "uncovered_cold_start",
     "useful_warmup_ratio",
     "execute_count",
