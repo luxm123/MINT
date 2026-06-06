@@ -124,6 +124,20 @@ python scripts/prepare_paper_tables.py \
 
 This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_action_counts.csv`, `table_budget_sensitivity.csv`, `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`. Paper tables use `effective_planner` for method labeling; `planner_type` is retained only as configuration provenance.
 
+Additional credibility checks:
+
+```bash
+python scripts/analyze_baseline_overlap.py \
+  --results-dir results/aws_baseline_main_20260606_061220 \
+  --output-dir results/aws_baseline_main_20260606_061220/overlap
+
+python scripts/prepare_pareto_data.py \
+  --matrix-csv results/aws_baseline_main_20260606_061220/summary_matrix.csv \
+  --output-dir results/aws_baseline_main_20260606_061220/pareto
+```
+
+Overlap analysis checks whether baseline warmup target sets are nearly identical. Pareto data supports cost-latency plots using `total_warmup` as cost and latency or cold-start rate as outcome.
+
 ## Delay-Shift Experiment
 
 The main matrix primarily evaluates Cancel, Replace, and warmup efficiency. It may produce `delay_count=0`, so it should not be used alone to claim that Delay contributes to MINT. Use the supplemental delay-shift stress test to validate the runtime rescheduling mechanism:
@@ -167,7 +181,9 @@ Supported baselines are:
 
 `mint_offline` and `mint_full` preserve the original heuristic planner behavior. `mint_markov_offline` uses the Markov policy analyzer without runtime adaptation, while `mint_markov_full` combines Markov-generated intents with runtime-adaptive scheduling.
 
-`periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure and periodically selects functions to warm while respecting `warmup_budget`. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing or bundling, so it should be described as ORION-like prewarming, not a full ORION reproduction.
+`periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure and periodically selects functions to warm while respecting `warmup_budget`. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing, bundling, or a complete ORION reproduction; describe it only as a DAG-aware fixed right-prewarming baseline.
+
+The optional `mixed` workload combines branch choice, join-style downstream convergence, and f4/f5 downstream timing. It is intended for stronger runtime-adaptation evaluation without changing the original `chain`, `fanout`, `branch`, and `join` workloads.
 
 ## Planner Selection
 

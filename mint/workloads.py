@@ -59,7 +59,7 @@ class WorkflowDAG:
         return {node: len(visit(node, set())) for node in self.nodes}
 
     def next_nodes(self, node: str, context: dict | None = None) -> list[str]:
-        if self.name != "branch" or node != "f1":
+        if self.name not in {"branch", "mixed"} or node != "f1":
             return self.successors[node]
         choice = (context or {}).get("branch", "left")
         return ["f2"] if choice == "left" else ["f3"]
@@ -94,6 +94,14 @@ WORKLOADS: dict[str, WorkflowDAG] = {
         edges=[("f1", "f2"), ("f1", "f3"), ("f2", "f4"), ("f3", "f4"), ("f4", "f5")],
         entry_nodes=["f1"],
         terminal_nodes=["f5"],
+    ),
+    "mixed": WorkflowDAG(
+        name="mixed",
+        nodes=["f1", "f2", "f3", "f4", "f5"],
+        edges=[("f1", "f2"), ("f1", "f3"), ("f2", "f4"), ("f3", "f4"), ("f4", "f5")],
+        entry_nodes=["f1"],
+        terminal_nodes=["f5"],
+        branch_rules={"f1": "context.branch == 'left' ? f2 : f3; f4 joins whichever branch was taken"},
     ),
 }
 

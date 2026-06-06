@@ -75,7 +75,11 @@ python scripts/prepare_paper_tables.py \
 
 The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, budget sensitivity, overall results, MINT improvement ratios, and run-level variability. Improvement ratios prefer `mint_markov_full` over `mint_full`, and prefer `mint_markov_offline` over `mint_offline` as the offline reference. Paper tables use `effective_planner` for method labeling; `planner_type` is retained only as configuration provenance.
 
-`periodic_keepwarm` represents a common industrial keep-warm strategy that ignores DAG structure and periodically warms functions under the same budget. `orion_like` represents a limited ORION-style DAG-aware right-prewarming baseline using stage order, expected start time, and fixed look-ahead prewarming. It intentionally excludes ORION right-sizing and bundling, so results should be labeled ORION-like rather than a complete ORION reproduction.
+`periodic_keepwarm` represents a common industrial keep-warm strategy that ignores DAG structure and periodically warms functions under the same budget. `orion_like` represents a limited ORION-style DAG-aware right-prewarming approximation using stage order, expected start time, and fixed look-ahead prewarming. It intentionally excludes ORION right-sizing, bundling, and the full ORION optimizer, so results should be labeled ORION-like rather than a complete ORION reproduction.
+
+When baseline results are close, use `scripts/analyze_baseline_overlap.py` to check whether their actual warmup targets are highly overlapping. Use `scripts/prepare_pareto_data.py` to build cost-latency plot data, since MINT's benefit may appear as a Pareto tradeoff rather than a simple average-latency win.
+
+The optional `mixed` workload adds branch choice plus downstream convergence (`f1 -> f2 or f3 -> f4 -> f5`). It is intended to stress branch, join, and downstream timing interaction while preserving the original four workloads for comparability.
 
 ## Delay-Shift Supplemental Experiment
 

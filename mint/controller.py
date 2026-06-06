@@ -262,7 +262,9 @@ class MintController:
             completed.append(node)
             for child in self.dag.next_nodes(node, context):
                 parents = self.dag.predecessors[child]
-                if all(parent in seen or parent not in completed + ready for parent in parents if self.dag.name == "branch"):
+                if self.dag.name == "mixed" and child == "f4" and any(parent in seen for parent in parents):
+                    ready.append(child)
+                elif all(parent in seen or parent not in completed + ready for parent in parents if self.dag.name == "branch"):
                     ready.append(child)
                 elif all(parent in seen for parent in parents):
                     ready.append(child)
