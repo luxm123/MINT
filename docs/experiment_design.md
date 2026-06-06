@@ -15,7 +15,7 @@ The original implementation is heuristic. It estimates stage timing from DAG dep
 
 The Markov planner implements the paper-oriented offline policy analyzer. It defines a finite-horizon controlled Markov model over DAG frontier, HOT/COLD state with retention buckets, completed functions, branch path, and time bucket. Actions are sets of functions to warm, constrained by warmup budget `B`. Transitions model real function calls, cold-start penalties, warmup effects, retention expiration, branch probability, fanout, and join readiness. Rewards are negative costs that include expected cold-start penalty, path penalty, warmup cost, wasted warmup penalty, and missed warmup penalty.
 
-The runtime scheduler can consume intents from either planner. `mint_full` is heuristic intents plus runtime scheduling. `mint_markov_full` is Markov intents plus runtime scheduling. During paper development, report both; after validation, `mint_markov_full` can become the primary MINT result.
+The runtime scheduler can consume intents from either planner. `mint_full` is heuristic intents plus runtime scheduling. `mint_markov_full` is Markov intents plus runtime scheduling and should be treated as the formal MINT result. Report `mint_full` as a heuristic prototype ablation.
 
 Measured metrics include end-to-end latency, latency percentiles, cold-start rate, total warmups, useful warmups, wasted warmups, missed warmups, useful warmup ratio, and scheduler action counts.
 
@@ -73,7 +73,23 @@ python scripts/prepare_paper_tables.py \
   --output-dir results/aws_matrix_main/paper_tables
 ```
 
-The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, and budget sensitivity. They also include MINT warmup reduction relative to `static_dag` and `mint_offline`, plus MINT latency reduction relative to `no_warmup`.
+The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, budget sensitivity, overall results, MINT improvement ratios, and run-level variability. Improvement ratios prefer `mint_markov_full` over `mint_full`, and prefer `mint_markov_offline` over `mint_offline` as the offline reference.
+
+## Delay-Shift Supplemental Experiment
+
+The main matrix can show `delay_count=0`, especially when intents are already valid at scheduling time. In that case it does not prove Delay's contribution. Use the supplemental delay-shift experiment to construct an upstream-lag scenario where downstream intents are too early and the scheduler should emit `delay` actions:
+
+```bash
+python scripts/run_delay_shift_experiment.py \
+  --config configs/mint_aws.yaml \
+  --baseline mint_markov_full \
+  --repetitions 3 \
+  --upstream-delay-ms 1200 \
+  --dry-run \
+  --output-dir results/dryrun_delay_shift_test
+```
+
+The output includes `delay_analysis.csv` with `delay_count`, missed warmups, cold starts, and average latency. Real AWS mode requires `--confirm-real-run`.
 
 ## Planner Configuration
 

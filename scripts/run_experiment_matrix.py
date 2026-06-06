@@ -27,6 +27,7 @@ SUMMARY_FIELDS = [
     "dag",
     "baseline",
     "planner_type",
+    "effective_planner",
     "budget",
     "repetitions",
     "output_dir",
@@ -71,6 +72,20 @@ def _utc_timestamp() -> str:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def effective_planner_for_baseline(baseline: str) -> str:
+    mapping = {
+        "no_warmup": "none",
+        "static_dag": "static",
+        "static_dag_unlimited": "static",
+        "mint_offline": "heuristic",
+        "mint_offline_unlimited": "heuristic",
+        "mint_full": "heuristic",
+        "mint_markov_offline": "markov",
+        "mint_markov_full": "markov",
+    }
+    return mapping.get(baseline, "unknown")
 
 
 def _write_matrix_outputs(output_root: Path, rows: list[dict[str, Any]], manifest: dict[str, Any]) -> None:
@@ -128,6 +143,7 @@ def _run_one(
         "dag": dag_name,
         "baseline": baseline,
         "planner_type": controller.planner_type,
+        "effective_planner": effective_planner_for_baseline(baseline),
         "budget": budget,
         "repetitions": repetitions,
         "output_dir": str(output_dir),

@@ -122,7 +122,23 @@ python scripts/prepare_paper_tables.py \
   --output-dir results/dryrun_matrix_test/paper_tables
 ```
 
-This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_action_counts.csv`, and `table_budget_sensitivity.csv`.
+This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_action_counts.csv`, `table_budget_sensitivity.csv`, `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`.
+
+## Delay-Shift Experiment
+
+The main matrix may produce `delay_count=0`, so it should not be used alone to claim that Delay contributes to MINT. Use the supplemental delay-shift experiment to validate the delay mechanism:
+
+```bash
+python scripts/run_delay_shift_experiment.py \
+  --config configs/mint_aws.yaml \
+  --baseline mint_markov_full \
+  --repetitions 3 \
+  --upstream-delay-ms 1200 \
+  --dry-run \
+  --output-dir results/dryrun_delay_shift_test
+```
+
+It writes `events.jsonl`, `summary.json`, and `delay_analysis.csv`.
 
 ## EC2
 
@@ -169,7 +185,7 @@ planner:
   retention_bucket_sec: 60
 ```
 
-For paper experiments, report both `mint_full` and `mint_markov_full` during the transition period. Once the Markov analyzer is validated against AWS data, `mint_markov_full` can be used as the main MINT result.
+For paper experiments, use `mint_markov_full` as the formal MINT result. Keep `mint_full` as a heuristic prototype ablation so the paper can separate Markov offline planning from runtime scheduling.
 
 ## Metrics
 

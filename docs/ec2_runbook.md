@@ -60,7 +60,7 @@ For a matrix smoke test:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws.yaml \
   --dags chain \
-  --baselines no_warmup static_dag mint_offline mint_full \
+  --baselines no_warmup static_dag mint_markov_offline mint_markov_full mint_full \
   --budgets 2 \
   --repetitions 2 \
   --cooldown-sec 1 \
@@ -83,7 +83,7 @@ Recommended first formal matrix:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws_real.yaml \
   --dags chain fanout branch join \
-  --baselines no_warmup static_dag mint_offline mint_full \
+  --baselines no_warmup static_dag mint_markov_offline mint_markov_full mint_full \
   --budgets 1 2 3 \
   --repetitions 10 \
   --cooldown-sec 120 \
@@ -115,6 +115,22 @@ python scripts/prepare_paper_tables.py \
 ```
 
 `--randomize-order` avoids always giving the same baseline first access to freshly cold Lambda environments. `--cooldown-sec` inserts a pause between configurations so retained Lambda execution environments are less likely to leak across treatments.
+
+Use `mint_markov_full` as the formal MINT baseline and keep `mint_full` as a heuristic ablation. The paper table step also writes `table_overall_summary.csv`, `table_mint_improvement.csv`, and `table_run_variability.csv`.
+
+Run the delay-shift supplemental experiment when you need evidence for the Delay mechanism:
+
+```bash
+python scripts/run_delay_shift_experiment.py \
+  --config configs/mint_aws.yaml \
+  --baseline mint_markov_full \
+  --repetitions 3 \
+  --upstream-delay-ms 1200 \
+  --dry-run \
+  --output-dir results/dryrun_delay_shift_test
+```
+
+Main matrix results with `delay_count=0` should not be used to claim Delay has been fully validated.
 
 ## 11. Troubleshooting
 
