@@ -136,7 +136,7 @@ python scripts/prepare_pareto_data.py \
   --output-dir results/aws_baseline_main_20260606_061220/pareto
 ```
 
-Overlap analysis checks whether baseline warmup target sets are nearly identical. Pareto data supports cost-latency plots using `total_warmup` as cost and latency or cold-start rate as outcome.
+Overlap analysis checks whether baseline warmup target sets are nearly identical, and also writes sequence, frequency-vector, and timing-bucket overlap tables. High target-set overlap alone does not prove two baselines are equivalent; if target, frequency, timing, and action summaries are all high-overlap, the small DAG is probably not separating those strategies well. Pareto data supports cost-latency plots using `total_warmup` as cost and average or P95 latency as the performance axis; `latency_per_warmup` is retained only as a diagnostic ratio, not the primary comparison rule.
 
 ## Delay-Shift Experiment
 
@@ -181,7 +181,7 @@ Supported baselines are:
 
 `mint_offline` and `mint_full` preserve the original heuristic planner behavior. `mint_markov_offline` uses the Markov policy analyzer without runtime adaptation, while `mint_markov_full` combines Markov-generated intents with runtime-adaptive scheduling.
 
-`periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure and periodically selects functions to warm while respecting `warmup_budget`. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing, bundling, or a complete ORION reproduction; describe it only as a DAG-aware fixed right-prewarming baseline.
+`periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure, stage order, or branch/path information, and selects functions in a round-robin keep-warm order while respecting `warmup_budget`. `static_dag` uses a fixed DAG-aware offline order and does not do runtime cancel, replace, or delay. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing, bundling, or a complete ORION reproduction; describe it only as a DAG-aware fixed right-prewarming baseline.
 
 The optional `mixed` workload combines branch choice, join-style downstream convergence, and f4/f5 downstream timing. It is intended for stronger runtime-adaptation evaluation without changing the original `chain`, `fanout`, `branch`, and `join` workloads.
 

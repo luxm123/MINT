@@ -55,6 +55,7 @@ class MintController:
         self._hot_until: dict[str, float] = {}
         self._warmups: set[str] = set()
         self.planner_type = self._planner_type_for_baseline()
+        self._workflow_index = 0
 
     def run(self, repetitions: int) -> dict[str, Any]:
         summaries = [self.run_once(index) for index in range(repetitions)]
@@ -76,7 +77,7 @@ class MintController:
         total_invocation_latency_ms = 0.0
 
         if self.baseline != "no_warmup":
-            warmup_count += self._run_warmups(run_id, intents, selected_nodes, start)
+            warmup_count += self._run_warmups(run_id, intents, selected_nodes, start, index)
 
         stages = self.dag.stages()
         aws_map = self.config.get("aws", {}).get("lambda_functions", {})
@@ -123,7 +124,7 @@ class MintController:
         append_jsonl(self.events_path, summary_event.to_dict())
         return summary_event.to_dict()
 
-    def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float) -> int:
+    def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
         if self.baseline in {
             "periodic",
             "periodic_keepwarm",
@@ -135,7 +136,7 @@ class MintController:
             "mint_offline_unlimited",
             "mint_markov_offline",
         }:
-            actions = self._static_baseline_actions(intents)
+            actions = self._static_baseline_actions(intents, workflow_index)
         else:
             call_probability = {node: (1.0 if node in selected_nodes else 0.0) for node in self.dag.nodes}
             runtime_state = {
@@ -202,13 +203,19 @@ class MintController:
 
     def _planner_config(self) -> dict[str, Any]:
         planner_config = copy.deepcopy(self.config)
-        planner_type = self.planner_type if self.planner_type in {"heuristic", "markov"} else "heuristic"
-        planner_config.setdefault("planner", {})["type"] = planner_type
+        planner_config.setdefault("planner", {})["type"] = self._intent_planner_type()
         return planner_config
 
-    def _static_baseline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+    def _intent_planner_type(self) -> str:
+        if self.baseline in {"mint_markov_offline", "mint_markov_full"}:
+            return "markov"
+        if self.baseline in {"mint_offline", "mint_full"}:
+            return "heuristic"
+        return "heuristic"
+
+    def _static_baseline_actions(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupAction]:
         if self.baseline == "periodic_keepwarm":
-            ranked = self._periodic_keepwarm_ranked_intents(intents)
+            ranked = self._periodic_keepwarm_ranked_intents(intents, workflow_index)
         elif self.baseline == "orion_like":
             ranked = self._orion_like_ranked_intents(intents)
         else:
@@ -224,27 +231,25 @@ class MintController:
                 actions.append(WarmupAction("replace", intent, intent.offline_gain, f"{self.baseline}_budget_exceeded"))
         return actions
 
-    def _periodic_keepwarm_ranked_intents(self, intents: list[WarmupIntent]) -> list[WarmupIntent]:
-        interval = float(self.config.get("baseline", {}).get("periodic_keepwarm_interval_sec", 300))
-        return sorted(
-            intents,
-            key=lambda item: (
-                item.logical_name,
-                int(item.planned_time_sec // max(interval, 1.0)),
-                -item.offline_gain,
-            ),
-        )
+    def _periodic_keepwarm_ranked_intents(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupIntent]:
+        ordered = sorted(intents, key=lambda item: item.logical_name)
+        if not ordered:
+            return []
+        shift = workflow_index % len(ordered)
+        return ordered[shift:] + ordered[:shift]
 
     def _orion_like_ranked_intents(self, intents: list[WarmupIntent]) -> list[WarmupIntent]:
-        lookahead = float(self.config.get("baseline", {}).get("orion_like_lookahead_sec", 0.5))
+        lookahead = float(self.config.get("baseline", {}).get("orion_like_lookahead_sec", self.config.get("baseline", {}).get("orion_lookahead_sec", 0.5)))
+        slack = float(self.config.get("baseline", {}).get("orion_stage_slack_sec", 0.25))
         stages = self.dag.stages()
         downstream = self.dag.downstream_counts()
         return sorted(
             intents,
             key=lambda item: (
-                max(0.0, item.planned_time_sec - lookahead),
-                stages.get(item.logical_name, item.stage),
-                -downstream.get(item.logical_name, 0),
+                0 if stages.get(item.logical_name, item.stage) > 0 else 1,
+                max(0.0, item.planned_time_sec - lookahead - slack),
+                -stages.get(item.logical_name, item.stage),
+                downstream.get(item.logical_name, 0),
                 -item.offline_gain,
                 item.logical_name,
             ),
