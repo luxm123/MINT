@@ -140,6 +140,8 @@ python scripts/run_delay_shift_experiment.py \
 
 It writes per-baseline `events.jsonl`, `runs.csv`, `summary.json`, plus a shared `delay_analysis.csv`. A delayed intent is re-executed as a `delayed_execute` warmup before the downstream real invocation. This is a constructed mechanism test, not a natural production traffic distribution.
 
+Delay-shift reports separate latency fields: `logical_end_to_end_latency_ms` is the stress-test model latency, `measured_wall_clock_latency_ms` is controller wall-clock time, `lambda_invocation_latency_ms_sum` is the sum of controller-side Lambda invoke elapsed times, and `reported_end_to_end_latency_ms` is the selected comparison metric. The default `latency_metric_used` is `measured_wall_clock_latency_ms`; use that for AWS-observed latency tables. Logical latency may be used only for mechanism explanation.
+
 ## EC2
 
 See `docs/ec2_runbook.md` for setup, dry-run validation, real-run execution, result download, and troubleshooting steps.

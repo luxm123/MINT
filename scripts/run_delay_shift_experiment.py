@@ -22,6 +22,8 @@ from mint.scheduler import WarmupAction, schedule_intents
 from mint.utils import append_jsonl, ensure_dir, load_yaml, monotonic_sec, new_id
 from mint.workloads import get_workload
 
+LATENCY_METRIC_USED = "measured_wall_clock_latency_ms"
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a delay-shift supplemental experiment.")
@@ -89,6 +91,30 @@ def _actions_for_baseline(intents: list[Any], baseline: str, config: dict[str, A
     return schedule_intents(intents, runtime_state, int(config.get("experiment", {}).get("warmup_budget", 1)), config)
 
 
+def _timed_invoke(
+    function_name: str,
+    payload: dict[str, Any],
+    *,
+    invocation_type: str = "RequestResponse",
+    dry_run: bool,
+    region: str | None,
+) -> tuple[dict[str, Any], float, float | None]:
+    start = monotonic_sec()
+    response = invoke_lambda(
+        function_name,
+        payload,
+        invocation_type=invocation_type,
+        dry_run=dry_run,
+        region_name=region,
+    )
+    elapsed_ms = round((monotonic_sec() - start) * 1000.0, 3)
+    returned_payload = response.get("payload") if isinstance(response, dict) else None
+    reported_duration = None
+    if isinstance(returned_payload, dict) and returned_payload.get("duration_ms") is not None:
+        reported_duration = float(returned_payload["duration_ms"])
+    return response, elapsed_ms, reported_duration
+
+
 def _invoke_warmup(
     *,
     events_path: Path,
@@ -102,13 +128,14 @@ def _invoke_warmup(
     original_planned_time_sec: float | None = None,
     delayed_warmup_time_sec: float | None = None,
     delay_reason: str | None = None,
-) -> None:
-    invoke_lambda(
+    logical_latency_ms: float = 0.0,
+) -> float:
+    _, controller_elapsed_ms, lambda_reported_duration_ms = _timed_invoke(
         intent.function_name,
         {"function_name": intent.logical_name, "run_id": run_id, "invocation_type": "warmup", "sleep_ms": 1},
         invocation_type="Event",
         dry_run=dry_run,
-        region_name=region,
+        region=region,
     )
     event = WarmupEvent(
         event_type="warmup",
@@ -121,6 +148,15 @@ def _invoke_warmup(
         action_reason=action_reason,
         gain=gain,
     ).to_dict()
+    event.update(
+        {
+            "controller_elapsed_ms": controller_elapsed_ms,
+            "lambda_reported_duration_ms": lambda_reported_duration_ms,
+            "logical_latency_ms": logical_latency_ms,
+            "is_measured_real_lambda_invocation": not dry_run,
+            "is_real_lambda_warmup": not dry_run,
+        }
+    )
     if delayed:
         delay_duration = max(0.0, float(delayed_warmup_time_sec or 0.0))
         event.update(
@@ -133,6 +169,7 @@ def _invoke_warmup(
             }
         )
     append_jsonl(events_path, event)
+    return controller_elapsed_ms
 
 
 def _run_one_baseline(
@@ -173,6 +210,9 @@ def _run_one_baseline(
     served_after_delay_count = 0
     delay_saved_cold_start_count = 0
     controller_wall_clock_ms_total = 0.0
+    logical_latency_ms_total = 0.0
+    lambda_invocation_latency_ms_sum_total = 0.0
+    reported_latency_ms_total = 0.0
 
     for _ in range(repetitions):
         run_id = new_id("delay-run")
@@ -183,7 +223,8 @@ def _run_one_baseline(
         delayed_queue: dict[str, WarmupAction] = {}
         warm_count = 0
         cold_count = 0
-        total_latency = 0.0
+        logical_latency_ms = 0.0
+        lambda_invocation_latency_ms_sum = 0.0
 
         for action in actions:
             intent = action.intent
@@ -202,7 +243,7 @@ def _run_one_baseline(
                 ).to_dict(),
             )
             if action.action_type == "execute":
-                _invoke_warmup(
+                elapsed_ms = _invoke_warmup(
                     events_path=events_path,
                     run_id=run_id,
                     intent=intent,
@@ -211,7 +252,9 @@ def _run_one_baseline(
                     dry_run=dry_run,
                     region=region,
                     delayed=False,
+                    logical_latency_ms=1.0,
                 )
+                lambda_invocation_latency_ms_sum += elapsed_ms
                 hot_until[intent.logical_name] = monotonic_sec() + retention_sec
                 warm_count += 1
             elif action.action_type == "delay":
@@ -223,7 +266,7 @@ def _run_one_baseline(
                 delayed_time = float(action.scheduled_time_sec or action.intent.window_start_sec)
                 if not dry_run:
                     time.sleep(min(0.05, max(0.0, delayed_time)))
-                _invoke_warmup(
+                elapsed_ms = _invoke_warmup(
                     events_path=events_path,
                     run_id=run_id,
                     intent=action.intent,
@@ -235,7 +278,9 @@ def _run_one_baseline(
                     original_planned_time_sec=action.intent.planned_time_sec,
                     delayed_warmup_time_sec=delayed_time,
                     delay_reason=action.action_reason,
+                    logical_latency_ms=1.0,
                 )
+                lambda_invocation_latency_ms_sum += elapsed_ms
                 hot_until[logical] = monotonic_sec() + retention_sec
                 warm_count += 1
                 delayed_execute_count += 1
@@ -244,47 +289,62 @@ def _run_one_baseline(
 
             sleep_ms = upstream_delay_ms if logical == "f1" else 10
             was_warm = hot_until.get(logical, 0.0) > monotonic_sec()
-            invoke_lambda(
+            _, controller_elapsed_ms, lambda_reported_duration_ms = _timed_invoke(
                 aws_map.get(logical, logical),
                 {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": sleep_ms},
                 dry_run=dry_run,
-                region_name=region,
+                region=region,
             )
             latency = warm_ms + (0.0 if was_warm else cold_ms) + (upstream_delay_ms if logical == "f1" else 0.0)
-            total_latency += latency
+            logical_latency_ms += latency
+            lambda_invocation_latency_ms_sum += controller_elapsed_ms
             cold_count += int(not was_warm)
             hot_until[logical] = monotonic_sec() + retention_sec
-            append_jsonl(
-                events_path,
-                InvocationEvent(
-                    event_type="invocation",
-                    run_id=run_id,
-                    function_name=aws_map.get(logical, logical),
-                    logical_name=logical,
-                    invocation_type="real",
-                    cold_start=not was_warm,
-                    latency_ms=round(latency, 3),
-                    stage=stages.get(logical, 0),
-                    status="ok",
-                ).to_dict(),
+            invocation_event = InvocationEvent(
+                event_type="invocation",
+                run_id=run_id,
+                function_name=aws_map.get(logical, logical),
+                logical_name=logical,
+                invocation_type="real",
+                cold_start=not was_warm,
+                latency_ms=round(latency, 3),
+                stage=stages.get(logical, 0),
+                status="ok",
+            ).to_dict()
+            invocation_event.update(
+                {
+                    "controller_elapsed_ms": controller_elapsed_ms,
+                    "lambda_reported_duration_ms": lambda_reported_duration_ms,
+                    "logical_latency_ms": round(latency, 3),
+                    "is_measured_real_lambda_invocation": not dry_run,
+                }
             )
+            append_jsonl(events_path, invocation_event)
 
         controller_wall_clock_ms = round((monotonic_sec() - start) * 1000.0, 3)
         controller_wall_clock_ms_total += controller_wall_clock_ms
-        latency_ms = round(max(controller_wall_clock_ms, total_latency), 3)
+        logical_latency_ms_total += logical_latency_ms
+        lambda_invocation_latency_ms_sum_total += lambda_invocation_latency_ms_sum
+        reported_latency_ms = controller_wall_clock_ms
+        reported_latency_ms_total += reported_latency_ms
         summary_event = WorkflowRunSummary(
             event_type="workflow_summary",
             run_id=run_id,
             dag="chain",
             baseline=baseline,
             planner_type=config.get("planner", {}).get("type", "heuristic"),
-            latency_ms=latency_ms,
+            latency_ms=reported_latency_ms,
             cold_start_count=cold_count,
             warmup_count=warm_count,
         )
         append_jsonl(events_path, summary_event.to_dict())
         row = summary_event.to_dict()
         row["controller_wall_clock_ms"] = controller_wall_clock_ms
+        row["logical_end_to_end_latency_ms"] = round(logical_latency_ms, 3)
+        row["measured_wall_clock_latency_ms"] = controller_wall_clock_ms
+        row["lambda_invocation_latency_ms_sum"] = round(lambda_invocation_latency_ms_sum, 3)
+        row["reported_end_to_end_latency_ms"] = reported_latency_ms
+        row["latency_metric_used"] = LATENCY_METRIC_USED
         run_rows.append(row)
 
     with runs_path.open("w", newline="", encoding="utf-8") as fh:
@@ -297,6 +357,11 @@ def _run_one_baseline(
                 "planner_type",
                 "latency_ms",
                 "controller_wall_clock_ms",
+                "logical_end_to_end_latency_ms",
+                "measured_wall_clock_latency_ms",
+                "lambda_invocation_latency_ms_sum",
+                "reported_end_to_end_latency_ms",
+                "latency_metric_used",
                 "cold_start_count",
                 "warmup_count",
                 "status",
@@ -317,6 +382,11 @@ def _run_one_baseline(
             "served_after_delay_count": served_after_delay_count,
             "delay_saved_cold_start_count": delay_saved_cold_start_count,
             "controller_wall_clock_latency_ms_avg": round(controller_wall_clock_ms_total / repetitions, 3) if repetitions else 0.0,
+            "logical_end_to_end_latency_ms_avg": round(logical_latency_ms_total / repetitions, 3) if repetitions else 0.0,
+            "measured_wall_clock_latency_ms_avg": round(controller_wall_clock_ms_total / repetitions, 3) if repetitions else 0.0,
+            "lambda_invocation_latency_ms_sum_avg": round(lambda_invocation_latency_ms_sum_total / repetitions, 3) if repetitions else 0.0,
+            "reported_end_to_end_latency_ms_avg": round(reported_latency_ms_total / repetitions, 3) if repetitions else 0.0,
+            "latency_metric_used": LATENCY_METRIC_USED,
         }
     )
     with summary_path.open("w", encoding="utf-8") as fh:
@@ -347,8 +417,8 @@ def run_delay_shift(config: dict[str, Any], args: argparse.Namespace, dry_run: b
             )
         )
 
-    static_latency = next((row["end_to_end_latency_ms_avg"] for row in summaries if row["baseline"] == "static_dag"), None)
-    mint_latency = next((row["end_to_end_latency_ms_avg"] for row in summaries if row["baseline"] == "mint_markov_full"), None)
+    static_latency = next((row["reported_end_to_end_latency_ms_avg"] for row in summaries if row["baseline"] == "static_dag"), None)
+    mint_latency = next((row["reported_end_to_end_latency_ms_avg"] for row in summaries if row["baseline"] == "mint_markov_full"), None)
     with analysis_path.open("w", newline="", encoding="utf-8") as fh:
         fieldnames = [
             "baseline",
@@ -362,8 +432,11 @@ def run_delay_shift(config: dict[str, Any], args: argparse.Namespace, dry_run: b
             "missed_warmup",
             "unserved_intent_cold_start",
             "cold_start_count",
-            "end_to_end_latency_ms_avg",
-            "controller_wall_clock_latency_ms_avg",
+            "logical_end_to_end_latency_ms_avg",
+            "measured_wall_clock_latency_ms_avg",
+            "lambda_invocation_latency_ms_sum_avg",
+            "reported_end_to_end_latency_ms_avg",
+            "latency_metric_used",
             "static_latency_ms_avg",
             "mint_latency_ms_avg",
         ]
@@ -383,8 +456,11 @@ def run_delay_shift(config: dict[str, Any], args: argparse.Namespace, dry_run: b
                     "missed_warmup": summary.get("missed_warmup", 0),
                     "unserved_intent_cold_start": summary.get("unserved_intent_cold_start", 0),
                     "cold_start_count": summary.get("cold_start_count", 0),
-                    "end_to_end_latency_ms_avg": summary.get("end_to_end_latency_ms_avg", 0),
-                    "controller_wall_clock_latency_ms_avg": summary.get("controller_wall_clock_latency_ms_avg", 0),
+                    "logical_end_to_end_latency_ms_avg": summary.get("logical_end_to_end_latency_ms_avg", 0),
+                    "measured_wall_clock_latency_ms_avg": summary.get("measured_wall_clock_latency_ms_avg", 0),
+                    "lambda_invocation_latency_ms_sum_avg": summary.get("lambda_invocation_latency_ms_sum_avg", 0),
+                    "reported_end_to_end_latency_ms_avg": summary.get("reported_end_to_end_latency_ms_avg", 0),
+                    "latency_metric_used": summary.get("latency_metric_used", LATENCY_METRIC_USED),
                     "static_latency_ms_avg": static_latency,
                     "mint_latency_ms_avg": mint_latency,
                 }

@@ -267,11 +267,23 @@ def test_delay_shift_dry_run_generates_delay_and_outputs(tmp_path):
     assert int(analysis["delay_count"].iloc[0]) > 0
     assert int(analysis["delayed_execute_count"].iloc[0]) > 0
     assert "unserved_intent_cold_start" in analysis.columns
+    assert analysis["latency_metric_used"].iloc[0] == "measured_wall_clock_latency_ms"
+    assert "reported_end_to_end_latency_ms_avg" in analysis.columns
     events = [json.loads(line) for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     delayed = [event for event in events if event.get("action") == "delayed_execute"]
     assert delayed
     assert all(event.get("served_after_delay") is True for event in delayed)
+    assert all("is_real_lambda_warmup" in event for event in delayed)
     assert int(analysis["unserved_intent_cold_start"].iloc[0]) < int(analysis["delay_count"].iloc[0])
+    summary = json.loads((output_dir / "summary.json").read_text(encoding="utf-8"))
+    for field in [
+        "logical_end_to_end_latency_ms_avg",
+        "measured_wall_clock_latency_ms_avg",
+        "lambda_invocation_latency_ms_sum_avg",
+        "reported_end_to_end_latency_ms_avg",
+        "latency_metric_used",
+    ]:
+        assert field in summary
 
 
 def test_delay_shift_can_compare_static_and_mint(tmp_path):
@@ -297,11 +309,25 @@ def test_delay_shift_can_compare_static_and_mint(tmp_path):
     assert int(analysis.loc["static_dag", "delay_count"]) == 0
     assert int(analysis.loc["mint_markov_full", "delay_count"]) > 0
     assert int(analysis.loc["mint_markov_full", "delayed_execute_count"]) > 0
+    assert set(analysis["latency_metric_used"]) == {"measured_wall_clock_latency_ms"}
+    for baseline in ["static_dag", "mint_markov_full"]:
+        baseline_dir = output_dir / baseline
+        assert (baseline_dir / "summary.json").exists()
+        assert (baseline_dir / "events.jsonl").exists()
+        assert (baseline_dir / "runs.csv").exists()
+        summary = json.loads((baseline_dir / "summary.json").read_text(encoding="utf-8"))
+        assert summary["latency_metric_used"] == "measured_wall_clock_latency_ms"
+        assert summary["reported_end_to_end_latency_ms_avg"] == summary["measured_wall_clock_latency_ms_avg"]
     mint_events = [
         json.loads(line)
         for line in (output_dir / "mint_markov_full" / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert any(event.get("action") == "delayed_execute" for event in mint_events)
+    invocation_events = [event for event in mint_events if event.get("event_type") == "invocation"]
+    assert invocation_events
+    assert all("controller_elapsed_ms" in event for event in invocation_events)
+    assert all("logical_latency_ms" in event for event in invocation_events)
+    assert all("is_measured_real_lambda_invocation" in event for event in invocation_events)
 
 
 def test_delay_shift_refuses_real_run_without_confirm(tmp_path):

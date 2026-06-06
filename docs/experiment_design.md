@@ -91,6 +91,8 @@ python scripts/run_delay_shift_experiment.py \
 
 The output includes `delay_analysis.csv` with `delay_count`, `delayed_execute_count`, served-after-delay count, saved cold-start count, missed warmups, cold starts, controller wall-clock latency, and average latency. Real AWS mode requires `--confirm-real-run`. This is a constructed mechanism test, not evidence that production traffic naturally follows the same distribution.
 
+Latency is reported with separate fields. `logical_end_to_end_latency_ms` is the controlled stress-test model value. `measured_wall_clock_latency_ms` is measured by the controller around the workflow execution. `lambda_invocation_latency_ms_sum` sums controller-side Lambda invoke elapsed time. `reported_end_to_end_latency_ms` uses the selected comparison metric, currently `measured_wall_clock_latency_ms` for every baseline. A paper table that discusses real AWS observed latency should use measured wall-clock latency; logical latency should be described only as mechanism-level stress-test latency.
+
 ## Planner Configuration
 
 Use the heuristic planner:
