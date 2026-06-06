@@ -39,7 +39,9 @@ def _ensure_effective_planner(df: pd.DataFrame) -> pd.DataFrame:
         return df
     mapping = {
         "no_warmup": "none",
+        "periodic_keepwarm": "periodic",
         "static_dag": "static",
+        "orion_like": "orion_like",
         "mint_offline": "heuristic",
         "mint_full": "heuristic",
         "mint_markov_offline": "markov",

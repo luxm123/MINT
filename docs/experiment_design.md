@@ -24,7 +24,7 @@ Measured metrics include end-to-end latency, latency percentiles, cold-start rat
 Formal experiments should vary:
 
 - DAG: `chain`, `fanout`, `branch`, `join`.
-- Baseline: `no_warmup`, `static_dag`, `mint_offline`, `mint_full`.
+- Baseline: `no_warmup`, `periodic_keepwarm`, `static_dag`, `orion_like`, `mint_offline`, `mint_full`.
 - Markov variants: `mint_markov_offline`, `mint_markov_full`.
 - Warmup budget: usually `1`, `2`, and `3`.
 - Repetitions: start with `10` for AWS pilot data, then increase if variance is high.
@@ -74,6 +74,8 @@ python scripts/prepare_paper_tables.py \
 ```
 
 The tables summarize latency by DAG and baseline, warmup efficiency, scheduler action counts, budget sensitivity, overall results, MINT improvement ratios, and run-level variability. Improvement ratios prefer `mint_markov_full` over `mint_full`, and prefer `mint_markov_offline` over `mint_offline` as the offline reference. Paper tables use `effective_planner` for method labeling; `planner_type` is retained only as configuration provenance.
+
+`periodic_keepwarm` represents a common industrial keep-warm strategy that ignores DAG structure and periodically warms functions under the same budget. `orion_like` represents a limited ORION-style DAG-aware right-prewarming baseline using stage order, expected start time, and fixed look-ahead prewarming. It intentionally excludes ORION right-sizing and bundling, so results should be labeled ORION-like rather than a complete ORION reproduction.
 
 ## Delay-Shift Supplemental Experiment
 

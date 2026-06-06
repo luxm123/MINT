@@ -152,9 +152,11 @@ Supported baselines are:
 
 - `no_warmup`
 - `periodic`
+- `periodic_keepwarm`
 - `independent`
 - `static_dag`
 - `static_dag_unlimited`
+- `orion_like`
 - `mint_offline`
 - `mint_offline_unlimited`
 - `mint_full`
@@ -164,6 +166,8 @@ Supported baselines are:
 `mint_full` uses offline intents plus the runtime scheduler. For fair comparison, `static_dag`, `mint_offline`, and `mint_full` all obey `experiment.warmup_budget`. The `_unlimited` variants are available only when you intentionally want an unbounded static/offline comparison.
 
 `mint_offline` and `mint_full` preserve the original heuristic planner behavior. `mint_markov_offline` uses the Markov policy analyzer without runtime adaptation, while `mint_markov_full` combines Markov-generated intents with runtime-adaptive scheduling.
+
+`periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure and periodically selects functions to warm while respecting `warmup_budget`. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing or bundling, so it should be described as ORION-like prewarming, not a full ORION reproduction.
 
 ## Planner Selection
 

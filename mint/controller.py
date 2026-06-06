@@ -19,9 +19,11 @@ from mint.workloads import WorkflowDAG, get_workload
 SUPPORTED_BASELINES = {
     "no_warmup",
     "periodic",
+    "periodic_keepwarm",
     "independent",
     "static_dag",
     "static_dag_unlimited",
+    "orion_like",
     "mint_offline",
     "mint_offline_unlimited",
     "mint_full",
@@ -124,9 +126,11 @@ class MintController:
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float) -> int:
         if self.baseline in {
             "periodic",
+            "periodic_keepwarm",
             "independent",
             "static_dag",
             "static_dag_unlimited",
+            "orion_like",
             "mint_offline",
             "mint_offline_unlimited",
             "mint_markov_offline",
@@ -190,15 +194,25 @@ class MintController:
             return "markov"
         if self.baseline in {"mint_offline", "mint_full"}:
             return "heuristic"
+        if self.baseline == "periodic_keepwarm":
+            return "periodic"
+        if self.baseline == "orion_like":
+            return "orion_like"
         return self.config.get("planner", {}).get("type", "heuristic")
 
     def _planner_config(self) -> dict[str, Any]:
         planner_config = copy.deepcopy(self.config)
-        planner_config.setdefault("planner", {})["type"] = self.planner_type
+        planner_type = self.planner_type if self.planner_type in {"heuristic", "markov"} else "heuristic"
+        planner_config.setdefault("planner", {})["type"] = planner_type
         return planner_config
 
     def _static_baseline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
-        ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        if self.baseline == "periodic_keepwarm":
+            ranked = self._periodic_keepwarm_ranked_intents(intents)
+        elif self.baseline == "orion_like":
+            ranked = self._orion_like_ranked_intents(intents)
+        else:
+            ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
         unlimited = self.baseline in {"static_dag_unlimited", "mint_offline_unlimited", "periodic", "independent"}
         budget = len(ranked) if unlimited else int(self.config.get("experiment", {}).get("warmup_budget", 1))
         budget = max(0, budget)
@@ -209,6 +223,32 @@ class MintController:
             else:
                 actions.append(WarmupAction("replace", intent, intent.offline_gain, f"{self.baseline}_budget_exceeded"))
         return actions
+
+    def _periodic_keepwarm_ranked_intents(self, intents: list[WarmupIntent]) -> list[WarmupIntent]:
+        interval = float(self.config.get("baseline", {}).get("periodic_keepwarm_interval_sec", 300))
+        return sorted(
+            intents,
+            key=lambda item: (
+                item.logical_name,
+                int(item.planned_time_sec // max(interval, 1.0)),
+                -item.offline_gain,
+            ),
+        )
+
+    def _orion_like_ranked_intents(self, intents: list[WarmupIntent]) -> list[WarmupIntent]:
+        lookahead = float(self.config.get("baseline", {}).get("orion_like_lookahead_sec", 0.5))
+        stages = self.dag.stages()
+        downstream = self.dag.downstream_counts()
+        return sorted(
+            intents,
+            key=lambda item: (
+                max(0.0, item.planned_time_sec - lookahead),
+                stages.get(item.logical_name, item.stage),
+                -downstream.get(item.logical_name, 0),
+                -item.offline_gain,
+                item.logical_name,
+            ),
+        )
 
     def _resolve_path(self, context: dict[str, Any]) -> list[str]:
         ready = list(self.dag.entry_nodes)

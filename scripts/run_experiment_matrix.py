@@ -56,7 +56,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a reproducible MINT experiment matrix.")
     parser.add_argument("--config", default="configs/mint_aws.yaml")
     parser.add_argument("--dags", nargs="+", default=["chain", "fanout", "branch", "join"])
-    parser.add_argument("--baselines", nargs="+", default=["no_warmup", "static_dag", "mint_offline", "mint_full"])
+    parser.add_argument(
+        "--baselines",
+        nargs="+",
+        default=["no_warmup", "periodic_keepwarm", "static_dag", "orion_like", "mint_offline", "mint_full"],
+    )
     parser.add_argument("--budgets", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cooldown-sec", type=float, default=0.0)
@@ -78,8 +82,10 @@ def _safe_name(value: str) -> str:
 def effective_planner_for_baseline(baseline: str) -> str:
     mapping = {
         "no_warmup": "none",
+        "periodic_keepwarm": "periodic",
         "static_dag": "static",
         "static_dag_unlimited": "static",
+        "orion_like": "orion_like",
         "mint_offline": "heuristic",
         "mint_offline_unlimited": "heuristic",
         "mint_full": "heuristic",

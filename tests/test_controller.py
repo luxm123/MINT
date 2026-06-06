@@ -30,3 +30,12 @@ def test_unlimited_static_baseline_can_warm_all_nodes(tmp_path):
     summary = controller.run(3)
     assert summary["total_warmup"] == 9
     assert summary["replace_count"] == 0
+
+
+def test_periodic_keepwarm_and_orion_like_obey_warmup_budget(tmp_path):
+    for baseline in ("periodic_keepwarm", "orion_like"):
+        controller = MintController(_config(tmp_path, baseline), dag=get_workload("chain"), baseline=baseline, dry_run=True)
+        summary = controller.run(2)
+        assert summary["total_warmup"] == 4
+        assert summary["execute_count"] == 4
+        assert summary["replace_count"] == 2

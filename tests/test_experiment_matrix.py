@@ -18,6 +18,8 @@ def test_experiment_matrix_dry_run_generates_summary(tmp_path):
             "--baselines",
             "no_warmup",
             "static_dag",
+            "periodic_keepwarm",
+            "orion_like",
             "--budgets",
             "2",
             "--repetitions",
@@ -37,14 +39,16 @@ def test_experiment_matrix_dry_run_generates_summary(tmp_path):
     assert matrix_json.exists()
     assert manifest.exists()
     rows = pd.read_csv(matrix_csv)
-    assert len(rows) == 2
+    assert len(rows) == 4
     assert "uncovered_cold_start" in rows.columns
     assert "unserved_intent_cold_start" in rows.columns
     assert "effective_planner" in rows.columns
-    assert set(rows["baseline"]) == {"no_warmup", "static_dag"}
+    assert set(rows["baseline"]) == {"no_warmup", "static_dag", "periodic_keepwarm", "orion_like"}
     planners = dict(zip(rows["baseline"], rows["effective_planner"]))
     assert planners["no_warmup"] == "none"
     assert planners["static_dag"] == "static"
+    assert planners["periodic_keepwarm"] == "periodic"
+    assert planners["orion_like"] == "orion_like"
 
 
 def test_experiment_matrix_records_failed_run_and_continues(tmp_path):
