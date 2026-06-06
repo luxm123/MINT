@@ -77,19 +77,19 @@ The tables summarize latency by DAG and baseline, warmup efficiency, scheduler a
 
 ## Delay-Shift Supplemental Experiment
 
-The main matrix can show `delay_count=0`, especially when intents are already valid at scheduling time. In that case it does not prove Delay's contribution. Use the supplemental delay-shift experiment to construct an upstream-lag scenario where downstream intents are too early and the scheduler should emit `delay` actions:
+The main matrix primarily validates Cancel, Replace, and warmup efficiency. It can show `delay_count=0`, especially when intents are already valid at scheduling time. In that case it does not prove Delay's contribution. Use the supplemental delay-shift stress test to construct an upstream-lag scenario where downstream intents are too early, the scheduler emits `delay`, and the delayed intent is rescheduled and executed before the downstream real call:
 
 ```bash
 python scripts/run_delay_shift_experiment.py \
   --config configs/mint_aws.yaml \
-  --baseline mint_markov_full \
+  --baselines static_dag mint_markov_full \
   --repetitions 3 \
   --upstream-delay-ms 1200 \
   --dry-run \
   --output-dir results/dryrun_delay_shift_test
 ```
 
-The output includes `delay_analysis.csv` with `delay_count`, missed warmups, cold starts, and average latency. Real AWS mode requires `--confirm-real-run`.
+The output includes `delay_analysis.csv` with `delay_count`, `delayed_execute_count`, served-after-delay count, saved cold-start count, missed warmups, cold starts, controller wall-clock latency, and average latency. Real AWS mode requires `--confirm-real-run`. This is a constructed mechanism test, not evidence that production traffic naturally follows the same distribution.
 
 ## Planner Configuration
 

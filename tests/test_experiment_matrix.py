@@ -265,7 +265,43 @@ def test_delay_shift_dry_run_generates_delay_and_outputs(tmp_path):
     assert (output_dir / "delay_analysis.csv").exists()
     analysis = pd.read_csv(output_dir / "delay_analysis.csv")
     assert int(analysis["delay_count"].iloc[0]) > 0
+    assert int(analysis["delayed_execute_count"].iloc[0]) > 0
     assert "unserved_intent_cold_start" in analysis.columns
+    events = [json.loads(line) for line in (output_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    delayed = [event for event in events if event.get("action") == "delayed_execute"]
+    assert delayed
+    assert all(event.get("served_after_delay") is True for event in delayed)
+    assert int(analysis["unserved_intent_cold_start"].iloc[0]) < int(analysis["delay_count"].iloc[0])
+
+
+def test_delay_shift_can_compare_static_and_mint(tmp_path):
+    output_dir = tmp_path / "delay_compare"
+    rc = run_delay_shift_experiment.main(
+        [
+            "--config",
+            "configs/mint_aws.yaml",
+            "--baselines",
+            "static_dag",
+            "mint_markov_full",
+            "--repetitions",
+            "2",
+            "--upstream-delay-ms",
+            "1200",
+            "--dry-run",
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    assert rc == 0
+    analysis = pd.read_csv(output_dir / "delay_analysis.csv").set_index("baseline")
+    assert int(analysis.loc["static_dag", "delay_count"]) == 0
+    assert int(analysis.loc["mint_markov_full", "delay_count"]) > 0
+    assert int(analysis.loc["mint_markov_full", "delayed_execute_count"]) > 0
+    mint_events = [
+        json.loads(line)
+        for line in (output_dir / "mint_markov_full" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(event.get("action") == "delayed_execute" for event in mint_events)
 
 
 def test_delay_shift_refuses_real_run_without_confirm(tmp_path):

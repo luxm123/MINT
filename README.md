@@ -126,19 +126,19 @@ This writes `table_latency_by_dag.csv`, `table_warmup_efficiency.csv`, `table_ac
 
 ## Delay-Shift Experiment
 
-The main matrix may produce `delay_count=0`, so it should not be used alone to claim that Delay contributes to MINT. Use the supplemental delay-shift experiment to validate the delay mechanism:
+The main matrix primarily evaluates Cancel, Replace, and warmup efficiency. It may produce `delay_count=0`, so it should not be used alone to claim that Delay contributes to MINT. Use the supplemental delay-shift stress test to validate the runtime rescheduling mechanism:
 
 ```bash
 python scripts/run_delay_shift_experiment.py \
   --config configs/mint_aws.yaml \
-  --baseline mint_markov_full \
+  --baselines static_dag mint_markov_full \
   --repetitions 3 \
   --upstream-delay-ms 1200 \
   --dry-run \
   --output-dir results/dryrun_delay_shift_test
 ```
 
-It writes `events.jsonl`, `summary.json`, and `delay_analysis.csv`.
+It writes per-baseline `events.jsonl`, `runs.csv`, `summary.json`, plus a shared `delay_analysis.csv`. A delayed intent is re-executed as a `delayed_execute` warmup before the downstream real invocation. This is a constructed mechanism test, not a natural production traffic distribution.
 
 ## EC2
 
