@@ -59,10 +59,16 @@ class WorkflowDAG:
         return {node: len(visit(node, set())) for node in self.nodes}
 
     def next_nodes(self, node: str, context: dict | None = None) -> list[str]:
-        if self.name not in {"branch", "mixed"} or node != "f1":
+        if node != "f1":
             return self.successors[node]
-        choice = (context or {}).get("branch", "left")
-        return ["f2"] if choice == "left" else ["f3"]
+        context = context or {}
+        if self.name in {"branch", "mixed", "deep_mixed"}:
+            choice = context.get("branch", "left")
+            return ["f2"] if choice == "left" else ["f3"]
+        if self.name == "wide_branch":
+            choices = ["f2", "f3", "f4", "f5"]
+            return [choices[int(context.get("branch_index", 0)) % len(choices)]]
+        return self.successors[node]
 
 
 WORKLOADS: dict[str, WorkflowDAG] = {
@@ -102,6 +108,41 @@ WORKLOADS: dict[str, WorkflowDAG] = {
         entry_nodes=["f1"],
         terminal_nodes=["f5"],
         branch_rules={"f1": "context.branch == 'left' ? f2 : f3; f4 joins whichever branch was taken"},
+    ),
+    "wide_branch": WorkflowDAG(
+        name="wide_branch",
+        nodes=["f1", "f2", "f3", "f4", "f5", "f6", "f7"],
+        edges=[
+            ("f1", "f2"),
+            ("f1", "f3"),
+            ("f1", "f4"),
+            ("f1", "f5"),
+            ("f2", "f6"),
+            ("f3", "f6"),
+            ("f4", "f6"),
+            ("f5", "f6"),
+            ("f6", "f7"),
+        ],
+        entry_nodes=["f1"],
+        terminal_nodes=["f7"],
+        branch_rules={"f1": "runtime selects exactly one of f2/f3/f4/f5; profile_mismatch can skew the realized branch"},
+    ),
+    "deep_mixed": WorkflowDAG(
+        name="deep_mixed",
+        nodes=["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"],
+        edges=[
+            ("f1", "f2"),
+            ("f1", "f3"),
+            ("f2", "f4"),
+            ("f4", "f6"),
+            ("f3", "f5"),
+            ("f5", "f6"),
+            ("f6", "f7"),
+            ("f7", "f8"),
+        ],
+        entry_nodes=["f1"],
+        terminal_nodes=["f8"],
+        branch_rules={"f1": "context.branch == 'left' ? f2 -> f4 : f3 -> f5; f6 joins whichever branch was taken"},
     ),
 }
 

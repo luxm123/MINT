@@ -24,6 +24,12 @@ class WarmupIntent:
 def _node_call_probability(dag: WorkflowDAG, node: str) -> float:
     if dag.name == "branch" and node in {"f2", "f3", "f4", "f5"}:
         return 0.5
+    if dag.name == "mixed" and node in {"f2", "f3"}:
+        return 0.5
+    if dag.name == "wide_branch" and node in {"f2", "f3", "f4", "f5"}:
+        return 0.25
+    if dag.name == "deep_mixed" and node in {"f2", "f3", "f4", "f5"}:
+        return 0.5
     return 1.0
 
 

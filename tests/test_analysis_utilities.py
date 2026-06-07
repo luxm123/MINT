@@ -149,6 +149,34 @@ def test_mixed_workload_executes_branch_join_path(tmp_path):
     assert summary["cold_start_count"] >= 4
 
 
+def test_adaptive_stress_workloads_execute_one_branch(tmp_path):
+    for name, expected_terminal in [("wide_branch", "f7"), ("deep_mixed", "f8")]:
+        dag = get_workload(name)
+        config = {
+            "aws": {"lambda_functions": {node: f"mint-{node}" for node in dag.nodes}},
+            "experiment": {
+                "baseline": "mint_markov_full",
+                "warmup_budget": 2,
+                "output_dir": str(tmp_path / name),
+                "profile_mismatch": True,
+                "timing_jitter_ms": 100,
+            },
+            "platform": {"default_retention_sec": 300, "default_cold_start_ms": 800, "default_warm_duration_ms": 100},
+            "planner": {"type": "markov", "horizon": 6},
+        }
+        controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+        summary = controller.run(2)
+        assert summary["workflow_runs"] == 2
+        events = [
+            json.loads(line)
+            for line in (tmp_path / name / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        invoked = [event["logical_name"] for event in events if event.get("event_type") == "invocation"]
+        assert expected_terminal in invoked
+        assert len(set(invoked) & {"f2", "f3", "f4", "f5"}) < 5
+
+
 def test_periodic_and_orion_differ_from_static_sequence(tmp_path):
     dag = get_workload("mixed")
     base_config = {

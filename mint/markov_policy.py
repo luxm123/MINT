@@ -112,6 +112,12 @@ class MarkovTransitionModel:
         if self.dag.name == "branch" and "f1" in called and current_branch is None:
             left = min(max(self.branch_probability_left, 0.0), 1.0)
             return [(left, "left"), (1.0 - left, "right")]
+        if self.dag.name in {"mixed", "deep_mixed"} and "f1" in called and current_branch is None:
+            left = min(max(self.branch_probability_left, 0.0), 1.0)
+            return [(left, "left"), (1.0 - left, "right")]
+        if self.dag.name == "wide_branch" and "f1" in called and current_branch is None:
+            probability = 1.0 / 4.0
+            return [(probability, branch) for branch in ("f2", "f3", "f4", "f5")]
         return [(1.0, current_branch)]
 
     def _next_frontier(self, completed: tuple[str, ...], called: tuple[str, ...], branch_path: str | None) -> tuple[str, ...]:
@@ -120,12 +126,22 @@ class MarkovTransitionModel:
         for node in called:
             if self.dag.name == "branch" and node == "f1":
                 candidates.update(["f2"] if branch_path == "left" else ["f3"])
+            elif self.dag.name in {"mixed", "deep_mixed"} and node == "f1":
+                candidates.update(["f2"] if branch_path == "left" else ["f3"])
+            elif self.dag.name == "wide_branch" and node == "f1":
+                candidates.update([branch_path or "f2"])
             else:
                 candidates.update(self.dag.successors[node])
         next_nodes = []
         preds = self.dag.predecessors
         for node in sorted(candidates):
             if node in completed_set:
+                continue
+            if self.dag.name == "mixed" and node == "f4" and any(parent in completed_set for parent in preds[node]):
+                next_nodes.append(node)
+                continue
+            elif self.dag.name in {"wide_branch", "deep_mixed"} and node == "f6" and any(parent in completed_set for parent in preds[node]):
+                next_nodes.append(node)
                 continue
             if all(parent in completed_set for parent in preds[node]):
                 next_nodes.append(node)
@@ -155,6 +171,10 @@ class MarkovTransitionModel:
             node = queue.pop(0)
             if self.dag.name == "branch" and node == "f1":
                 children = ["f2"] if state.branch_path == "left" else ["f3"] if state.branch_path == "right" else self.dag.successors[node]
+            elif self.dag.name in {"mixed", "deep_mixed"} and node == "f1":
+                children = ["f2"] if state.branch_path == "left" else ["f3"] if state.branch_path == "right" else self.dag.successors[node]
+            elif self.dag.name == "wide_branch" and node == "f1":
+                children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4", "f5"} else self.dag.successors[node]
             else:
                 children = self.dag.successors[node]
             for child in children:

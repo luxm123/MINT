@@ -64,6 +64,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--budgets", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--cooldown-sec", type=float, default=0.0)
+    parser.add_argument("--profile-mismatch", action="store_true", help="Enable controlled branch-profile mismatch for adaptive stress DAGs.")
+    parser.add_argument("--timing-jitter-ms", type=float, default=0.0, help="Controlled per-stage timing jitter for adaptive stress DAGs.")
+    parser.add_argument("--branch-seed", type=int, default=0, help="Deterministic branch sequence seed for adaptive stress DAGs.")
     parser.add_argument("--randomize-order", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Never call AWS; enabled by default unless --confirm-real-run is used.")
     parser.add_argument("--confirm-real-run", action="store_true", help="Required to allow real AWS Lambda invocation.")
@@ -120,6 +123,9 @@ def _run_one(
     dry_run: bool,
     output_root: Path,
     timestamp: str,
+    profile_mismatch: bool = False,
+    timing_jitter_ms: float = 0.0,
+    branch_seed: int = 0,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base_config)
     exp = config.setdefault("experiment", {})
@@ -128,6 +134,9 @@ def _run_one(
     exp["warmup_budget"] = budget
     exp["repetitions"] = repetitions
     exp["dry_run"] = dry_run
+    exp["profile_mismatch"] = profile_mismatch
+    exp["timing_jitter_ms"] = timing_jitter_ms
+    exp["branch_seed"] = branch_seed
 
     run_stamp = _utc_timestamp()
     output_dir = output_root / f"{run_stamp}_{_safe_name(dag_name)}_{_safe_name(baseline)}_B{budget}"
@@ -185,6 +194,9 @@ def main(argv: list[str] | None = None) -> int:
         "budgets": args.budgets,
         "repetitions": args.repetitions,
         "cooldown_sec": args.cooldown_sec,
+        "profile_mismatch": args.profile_mismatch,
+        "timing_jitter_ms": args.timing_jitter_ms,
+        "branch_seed": args.branch_seed,
         "randomize_order": args.randomize_order,
         "dry_run": dry_run,
         "planner_type": base_config.get("planner", {}).get("type", "heuristic"),
@@ -196,7 +208,19 @@ def main(argv: list[str] | None = None) -> int:
 
     for index, (dag_name, baseline, budget) in enumerate(configs):
         try:
-            row = _run_one(base_config, dag_name, baseline, budget, args.repetitions, dry_run, output_root, timestamp)
+            row = _run_one(
+                base_config,
+                dag_name,
+                baseline,
+                budget,
+                args.repetitions,
+                dry_run,
+                output_root,
+                timestamp,
+                args.profile_mismatch,
+                args.timing_jitter_ms,
+                args.branch_seed,
+            )
             rows.append(row)
             _write_matrix_outputs(output_root, rows, manifest)
         except Exception as exc:

@@ -65,6 +65,47 @@ Real AWS experiments may produce Lambda request, duration, logging, and related 
 
 Use `scripts/run_experiment_matrix.py` to evaluate multiple DAGs, baselines, and warmup budgets with independent output directories and a shared summary table.
 
+The main AWS benchmark is a representative Serverless DAG workflow benchmark rather than a production workload benchmark. The four DAGs cover common workflow structures: `chain` is a linear dependency workflow, `fanout` is a parallel dispatch workflow, `branch` is a runtime path-selection workflow, and `join` is a convergence workflow. Each DAG node maps to a controlled AWS Lambda microbenchmark function. The function body performs controlled lightweight computation or fixed-duration sleep to simulate the function execution phase. These experiments evaluate DAG-level warmup scheduling behavior under different workflow topologies; they do not claim to cover real production traces or application-specific business semantics.
+
+For the paper core comparison, use the adaptive stress benchmark because the basic `chain`/`fanout`/`branch`/`join` DAGs can make fixed prewarming baselines choose highly overlapping warmup targets. The adaptive stress benchmark uses `wide_branch` and `deep_mixed` with `--profile-mismatch`, fixed `--branch-seed`, `--timing-jitter-ms 800`, budgets `1 2 3`, and baselines `no_warmup periodic_keepwarm static_dag orion_like mint_markov_full`. It is designed to test MINT under path uncertainty, profile mismatch, timing jitter, and budget pressure.
+
+Recommended adaptive stress dry-run:
+
+```bash
+python scripts/run_experiment_matrix.py \
+  --config configs/mint_aws.yaml \
+  --dags wide_branch deep_mixed \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --budgets 1 2 3 \
+  --repetitions 10 \
+  --cooldown-sec 0 \
+  --profile-mismatch \
+  --timing-jitter-ms 800 \
+  --branch-seed 42 \
+  --randomize-order \
+  --dry-run \
+  --output-root results/dryrun_adaptive_stress_core
+```
+
+Recommended EC2 real run:
+
+```bash
+nohup python scripts/run_experiment_matrix.py \
+  --config configs/mint_aws_real.yaml \
+  --dags wide_branch deep_mixed \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --budgets 1 2 3 \
+  --repetitions 10 \
+  --cooldown-sec 120 \
+  --profile-mismatch \
+  --timing-jitter-ms 800 \
+  --branch-seed 42 \
+  --randomize-order \
+  --confirm-real-run \
+  --output-root results/aws_adaptive_stress_main \
+  > adaptive_stress_main.log 2>&1 &
+```
+
 Quick dry-run validation:
 
 ```bash

@@ -67,7 +67,7 @@ class MintController:
 
     def run_once(self, index: int) -> dict[str, Any]:
         run_id = new_id("run")
-        context = {"branch": "left" if index % 2 == 0 else "right"}
+        context = self._run_context(index)
         planner_config = self._planner_config()
         intents = plan_intents(self.dag, planner_config)
         selected_nodes = self._resolve_path(context)
@@ -93,6 +93,7 @@ class MintController:
                 region_name=self.config.get("aws", {}).get("region"),
             )
             latency_ms = self._simulated_latency_ms(was_warm)
+            latency_ms += self._timing_jitter_ms(index, stages.get(logical, 0))
             total_invocation_latency_ms += latency_ms
             cold = not was_warm
             cold_count += int(cold)
@@ -269,11 +270,31 @@ class MintController:
                 parents = self.dag.predecessors[child]
                 if self.dag.name == "mixed" and child == "f4" and any(parent in seen for parent in parents):
                     ready.append(child)
+                elif self.dag.name == "wide_branch" and child == "f6" and any(parent in seen for parent in parents):
+                    ready.append(child)
+                elif self.dag.name == "deep_mixed" and child == "f6" and any(parent in seen for parent in parents):
+                    ready.append(child)
                 elif all(parent in seen or parent not in completed + ready for parent in parents if self.dag.name == "branch"):
                     ready.append(child)
                 elif all(parent in seen for parent in parents):
                     ready.append(child)
         return completed
+
+    def _run_context(self, index: int) -> dict[str, Any]:
+        branch_seed = int(self.config.get("experiment", {}).get("branch_seed", 0))
+        if self.dag.name == "wide_branch":
+            mismatch = bool(self.config.get("experiment", {}).get("profile_mismatch", False))
+            branch_index = (index + branch_seed) % 4
+            if mismatch:
+                branch_index = (branch_index * 2 + 1) % 4
+            return {"branch_index": branch_index}
+        return {"branch": "left" if (index + branch_seed) % 2 == 0 else "right"}
+
+    def _timing_jitter_ms(self, index: int, stage: int) -> float:
+        jitter = float(self.config.get("experiment", {}).get("timing_jitter_ms", 0.0))
+        if jitter <= 0 or self.dag.name != "deep_mixed":
+            return 0.0
+        return round(((index + stage) % 3 - 1) * jitter / 2.0, 3)
 
     def _simulated_latency_ms(self, warm: bool) -> float:
         platform = self.config.get("platform", {})
