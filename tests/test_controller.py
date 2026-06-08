@@ -47,21 +47,42 @@ def _events(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def test_path_aware_greedy_only_warms_selected_path_and_budget(tmp_path):
+def test_path_aware_greedy_does_not_use_full_selected_path(tmp_path):
     dag = get_workload("wide_branch")
     config = _config(tmp_path, "path_aware_greedy")
     config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
-    config["experiment"].update({"warmup_budget": 1, "branch_seed": 0, "profile_mismatch": False})
+    config["experiment"].update({"warmup_budget": 4, "branch_seed": 1, "profile_mismatch": False})
     controller = MintController(config, dag=dag, baseline="path_aware_greedy", dry_run=True)
     summary = controller.run(1)
-    assert summary["total_warmup"] <= 1
-    assert summary["execute_count"] <= 1
+    assert summary["total_warmup"] <= 4
+    assert summary["execute_count"] <= 4
     events = _events(tmp_path / "path_aware_greedy" / "events.jsonl")
     invoked = {event["logical_name"] for event in events if event.get("event_type") == "invocation"}
     warmed = {event["logical_name"] for event in events if event.get("event_type") == "warmup"}
-    assert warmed <= invoked
-    assert warmed == {"f1"}
-    assert any(event.get("action") == "cancel" for event in events if event.get("event_type") == "scheduler_decision")
+    assert "f6" in warmed
+    assert "f7" in warmed
+    assert "f2" in warmed
+    assert "f3" in invoked
+    assert "f2" not in invoked
+    assert any(event.get("action") == "replace" for event in events if event.get("event_type") == "scheduler_decision")
+
+
+def test_path_aware_greedy_uses_profile_future_candidates_and_budget(tmp_path):
+    dag = get_workload("deep_mixed")
+    config = _config(tmp_path, "path_aware_greedy")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_seed": 0})
+    controller = MintController(config, dag=dag, baseline="path_aware_greedy", dry_run=True)
+    summary = controller.run(1)
+
+    events = _events(tmp_path / "path_aware_greedy" / "events.jsonl")
+    warmed = [event["logical_name"] for event in events if event.get("event_type") == "warmup"]
+    decisions = [event for event in events if event.get("event_type") == "scheduler_decision"]
+    assert summary["total_warmup"] == 2
+    assert warmed == ["f1", "f6"]
+    assert "f6" not in dag.entry_nodes
+    assert sum(1 for event in decisions if event.get("action") == "replace") == len(dag.nodes) - 2
+    assert not any(event.get("action") == "delay" for event in decisions)
 
 
 def test_oracle_path_only_warms_real_path_and_budget(tmp_path):

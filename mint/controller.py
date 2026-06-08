@@ -129,7 +129,7 @@ class MintController:
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
         if self.baseline == "path_aware_greedy":
-            actions = self._path_aware_greedy_actions(intents, self._observable_frontier())
+            actions = self._path_aware_greedy_actions(intents)
         elif self.baseline == "oracle_path":
             actions = self._oracle_path_actions(intents, selected_nodes)
         elif self.baseline in {
@@ -247,26 +247,28 @@ class MintController:
                 probabilities[node] = 0.5
         return probabilities
 
-    def _path_aware_greedy_actions(self, intents: list[WarmupIntent], observable_nodes: list[str]) -> list[WarmupAction]:
-        observable = set(observable_nodes)
+    def _path_aware_greedy_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        call_probability = self._profile_call_probability()
         now = monotonic_sec()
         budget = self._warmup_budget()
         actions: list[WarmupAction] = []
-        candidates: list[WarmupIntent] = []
+        candidates: list[tuple[WarmupIntent, float]] = []
         for intent in intents:
-            if intent.logical_name not in observable:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_not_currently_observable"))
+            p_call = float(call_probability.get(intent.logical_name, 0.0))
+            expected_gain = round(intent.offline_gain * p_call, 4)
+            if p_call <= 0.0:
+                actions.append(WarmupAction("cancel", intent, expected_gain, "path_aware_not_profile_reachable"))
             elif self._hot_until.get(intent.logical_name, 0.0) > now:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_already_hot"))
+                actions.append(WarmupAction("cancel", intent, expected_gain, "path_aware_already_hot"))
             else:
-                candidates.append(intent)
+                candidates.append((intent, expected_gain))
 
-        ranked = sorted(candidates, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
-        for index, intent in enumerate(ranked):
+        ranked = sorted(candidates, key=lambda item: (-item[1], item[0].stage, item[0].planned_time_sec, item[0].logical_name))
+        for index, (intent, expected_gain) in enumerate(ranked):
             if index < budget:
-                actions.append(WarmupAction("execute", intent, intent.offline_gain, "path_aware_greedy_within_budget"))
+                actions.append(WarmupAction("execute", intent, expected_gain, "path_aware_profile_expected_gain_within_budget"))
             else:
-                actions.append(WarmupAction("replace", intent, intent.offline_gain, "path_aware_greedy_budget_exceeded"))
+                actions.append(WarmupAction("replace", intent, expected_gain, "path_aware_greedy_budget_exceeded"))
         return actions
 
     def _oracle_path_actions(self, intents: list[WarmupIntent], selected_nodes: list[str]) -> list[WarmupAction]:
