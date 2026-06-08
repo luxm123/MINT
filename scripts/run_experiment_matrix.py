@@ -89,6 +89,8 @@ def effective_planner_for_baseline(baseline: str) -> str:
         "static_dag": "static",
         "static_dag_unlimited": "static",
         "orion_like": "orion_like",
+        "path_aware_greedy": "runtime_greedy",
+        "oracle_path": "oracle",
         "mint_offline": "heuristic",
         "mint_offline_unlimited": "heuristic",
         "mint_full": "heuristic",

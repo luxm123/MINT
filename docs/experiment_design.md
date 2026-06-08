@@ -31,7 +31,9 @@ Formal experiments should vary:
 
 The first main experiment should be described as a representative Serverless DAG workflow benchmark, not as a production workload benchmark or a different-load-intensity study. The four DAGs represent workflow structures: `chain` is a linear dependency workflow, `fanout` is a parallel dispatch workflow, `branch` is a runtime path-selection workflow, and `join` is a convergence workflow. Each DAG node is a controlled AWS Lambda microbenchmark function whose body performs controlled lightweight computation or fixed-duration sleep to simulate the function execution phase. The goal is to evaluate DAG-level warmup scheduling behavior across topology patterns, not to model a particular business application or claim coverage of real production traces.
 
-Because fixed prewarming baselines can choose very similar warmup targets on the small standard DAGs, the paper core experiment should use the adaptive stress benchmark. It contains `wide_branch` (`f1 -> branch(f2/f3/f4/f5) -> f6 -> f7`) and `deep_mixed` (`f1 -> f2 or f3`, `f2 -> f4 -> f6`, `f3 -> f5 -> f6`, `f6 -> f7 -> f8`). Run it with profile mismatch enabled, fixed `branch_seed`, `timing_jitter_ms=800`, budgets `1 2 3`, and baselines `no_warmup`, `periodic_keepwarm`, `static_dag`, `orion_like`, and `mint_markov_full`. This benchmark is intended to evaluate path uncertainty, profile mismatch, timing jitter, and budget-limited adaptive scheduling.
+Because fixed prewarming baselines can choose very similar warmup targets on the small standard DAGs, the paper core experiment should use the adaptive stress benchmark. It contains `wide_branch` (`f1 -> branch(f2/f3/f4/f5) -> f6 -> f7`) and `deep_mixed` (`f1 -> f2 or f3`, `f2 -> f4 -> f6`, `f3 -> f5 -> f6`, `f6 -> f7 -> f8`). Run it with profile mismatch enabled, fixed `branch_seed`, `timing_jitter_ms=800`, budgets `1 2 3`, and baselines `no_warmup`, `periodic_keepwarm`, `static_dag`, `orion_like`, `path_aware_greedy`, `oracle_path`, and `mint_markov_full`. This benchmark is intended to evaluate path uncertainty, profile mismatch, timing jitter, and budget-limited adaptive scheduling.
+
+The final reported methods are `No warmup`, `Best-fixed`, `Path-aware greedy`, `MINT`, and `Oracle`. `Best-fixed` is not run as a separate controller baseline; it is computed in analysis by selecting the lowest-P95 row for each workload-budget pair among Periodic keep-warm, DAG-gain fixed, and Fixed look-ahead. `Path-aware greedy` is a simple online greedy baseline that uses the realized path and current hot/cold state, but not MINT's Markov policy. `Oracle` assumes advance knowledge of the realized path and is an ideal upper bound, not a deployable method or fair baseline. Fixed look-ahead follows the idea of DAG-aware right-prewarming, but the project does not claim to reproduce full ORION.
 
 Recommended adaptive stress dry-run:
 
@@ -39,7 +41,7 @@ Recommended adaptive stress dry-run:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
   --cooldown-sec 0 \
@@ -57,7 +59,7 @@ Recommended EC2 real run:
 nohup python scripts/run_experiment_matrix.py \
   --config configs/mint_aws_real.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
   --cooldown-sec 120 \

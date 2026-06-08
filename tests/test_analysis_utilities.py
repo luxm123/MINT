@@ -6,6 +6,7 @@ from mint.controller import MintController
 from mint.workloads import get_workload
 from scripts.analyze_baseline_overlap import analyze_overlap
 from scripts.prepare_pareto_data import prepare_pareto
+from scripts.plot_adaptive_stress_figures import compute_best_fixed
 
 
 def _write_events(path, targets):
@@ -128,6 +129,38 @@ def test_prepare_pareto_data_outputs_csv(tmp_path):
     assert mint["warmup_reduction_vs_static"] > 0
     assert paths["p95"].exists()
     assert paths["report"].exists()
+
+
+def test_best_fixed_selects_lowest_p95_per_workload_budget():
+    rows = []
+    for baseline, p95 in [("periodic_keepwarm", 300), ("static_dag", 250), ("orion_like", 275)]:
+        rows.append(
+            {
+                "dag": "wide_branch",
+                "budget": 1,
+                "baseline": baseline,
+                "p95_latency_ms": p95,
+                "end_to_end_latency_ms_avg": p95 / 2,
+                "p99_latency_ms": p95 + 10,
+                "cold_start_count": 1,
+                "cold_start_rate": 0.1,
+                "total_warmup": 10,
+                "useful_warmup": 5,
+                "wasted_warmup": 5,
+                "useful_warmup_ratio": 0.5,
+                "unserved_intent_cold_start": 1,
+                "execute_count": 10,
+                "cancel_count": 0,
+                "replace_count": 2,
+                "delay_count": 0,
+            }
+        )
+    best = compute_best_fixed(pd.DataFrame(rows))
+    assert len(best) == 1
+    row = best.iloc[0]
+    assert row["baseline"] == "best_fixed"
+    assert row["source_fixed_baseline"] == "static_dag"
+    assert row["p95_latency_ms"] == 250
 
 
 def test_mixed_workload_executes_branch_join_path(tmp_path):

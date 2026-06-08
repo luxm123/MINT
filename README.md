@@ -67,7 +67,9 @@ Use `scripts/run_experiment_matrix.py` to evaluate multiple DAGs, baselines, and
 
 The main AWS benchmark is a representative Serverless DAG workflow benchmark rather than a production workload benchmark. The four DAGs cover common workflow structures: `chain` is a linear dependency workflow, `fanout` is a parallel dispatch workflow, `branch` is a runtime path-selection workflow, and `join` is a convergence workflow. Each DAG node maps to a controlled AWS Lambda microbenchmark function. The function body performs controlled lightweight computation or fixed-duration sleep to simulate the function execution phase. These experiments evaluate DAG-level warmup scheduling behavior under different workflow topologies; they do not claim to cover real production traces or application-specific business semantics.
 
-For the paper core comparison, use the adaptive stress benchmark because the basic `chain`/`fanout`/`branch`/`join` DAGs can make fixed prewarming baselines choose highly overlapping warmup targets. The adaptive stress benchmark uses `wide_branch` and `deep_mixed` with `--profile-mismatch`, fixed `--branch-seed`, `--timing-jitter-ms 800`, budgets `1 2 3`, and baselines `no_warmup periodic_keepwarm static_dag orion_like mint_markov_full`. It is designed to test MINT under path uncertainty, profile mismatch, timing jitter, and budget pressure.
+For the paper core comparison, use the adaptive stress benchmark because the basic `chain`/`fanout`/`branch`/`join` DAGs can make fixed prewarming baselines choose highly overlapping warmup targets. The adaptive stress benchmark uses `wide_branch` and `deep_mixed` with `--profile-mismatch`, fixed `--branch-seed`, `--timing-jitter-ms 800`, and budgets `1 2 3`. It is designed to test MINT under path uncertainty, profile mismatch, timing jitter, and budget pressure.
+
+The final adaptive stress comparison reports `No warmup`, `Best-fixed`, `Path-aware greedy`, `MINT`, and `Oracle`. `Best-fixed` is computed during analysis by selecting the lowest-P95 result for each workload-budget pair among Periodic keep-warm, DAG-gain fixed, and Fixed look-ahead. `Path-aware greedy` is a simple online baseline that uses the realized path and hot/cold state, filters off-path and already-hot candidates, and warms the highest-gain candidates within the same budget. `Oracle` is an ideal path-aware upper bound with advance knowledge of the realized path; it is not a deployable method and should not be treated as a fair baseline. Fixed look-ahead is inspired by DAG-aware right-prewarming, but it is not a complete ORION reproduction.
 
 Recommended adaptive stress dry-run:
 
@@ -75,7 +77,7 @@ Recommended adaptive stress dry-run:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
   --cooldown-sec 0 \
@@ -93,7 +95,7 @@ Recommended EC2 real run:
 nohup python scripts/run_experiment_matrix.py \
   --config configs/mint_aws_real.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like mint_markov_full \
+  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
   --cooldown-sec 120 \

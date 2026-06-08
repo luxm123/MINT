@@ -24,6 +24,8 @@ SUPPORTED_BASELINES = {
     "static_dag",
     "static_dag_unlimited",
     "orion_like",
+    "path_aware_greedy",
+    "oracle_path",
     "mint_offline",
     "mint_offline_unlimited",
     "mint_full",
@@ -126,7 +128,11 @@ class MintController:
         return summary_event.to_dict()
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
-        if self.baseline in {
+        if self.baseline == "path_aware_greedy":
+            actions = self._path_aware_greedy_actions(intents, selected_nodes)
+        elif self.baseline == "oracle_path":
+            actions = self._oracle_path_actions(intents, selected_nodes)
+        elif self.baseline in {
             "periodic",
             "periodic_keepwarm",
             "independent",
@@ -200,6 +206,10 @@ class MintController:
             return "periodic"
         if self.baseline == "orion_like":
             return "orion_like"
+        if self.baseline == "path_aware_greedy":
+            return "runtime_greedy"
+        if self.baseline == "oracle_path":
+            return "oracle"
         return self.config.get("planner", {}).get("type", "heuristic")
 
     def _planner_config(self) -> dict[str, Any]:
@@ -214,6 +224,53 @@ class MintController:
             return "heuristic"
         return "heuristic"
 
+    def _warmup_budget(self) -> int:
+        return max(0, int(self.config.get("experiment", {}).get("warmup_budget", 1)))
+
+    def _path_aware_greedy_actions(self, intents: list[WarmupIntent], selected_nodes: list[str]) -> list[WarmupAction]:
+        selected = set(selected_nodes)
+        now = monotonic_sec()
+        budget = self._warmup_budget()
+        actions: list[WarmupAction] = []
+        candidates: list[WarmupIntent] = []
+        for intent in intents:
+            if intent.logical_name not in selected:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_not_on_selected_path"))
+            elif self._hot_until.get(intent.logical_name, 0.0) > now:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_already_hot"))
+            else:
+                candidates.append(intent)
+
+        ranked = sorted(candidates, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        for index, intent in enumerate(ranked):
+            if index < budget:
+                actions.append(WarmupAction("execute", intent, intent.offline_gain, "path_aware_greedy_within_budget"))
+            else:
+                actions.append(WarmupAction("replace", intent, intent.offline_gain, "path_aware_greedy_budget_exceeded"))
+        return actions
+
+    def _oracle_path_actions(self, intents: list[WarmupIntent], selected_nodes: list[str]) -> list[WarmupAction]:
+        selected = set(selected_nodes)
+        now = monotonic_sec()
+        budget = self._warmup_budget()
+        actions: list[WarmupAction] = []
+        candidates: list[WarmupIntent] = []
+        for intent in intents:
+            if intent.logical_name not in selected:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "oracle_not_on_real_path"))
+            elif self._hot_until.get(intent.logical_name, 0.0) > now:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "oracle_already_hot"))
+            else:
+                candidates.append(intent)
+
+        ranked = sorted(candidates, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        for index, intent in enumerate(ranked):
+            if index < budget:
+                actions.append(WarmupAction("execute", intent, intent.offline_gain, "oracle_path_upper_bound"))
+            else:
+                actions.append(WarmupAction("replace", intent, intent.offline_gain, "oracle_budget_exceeded"))
+        return actions
+
     def _static_baseline_actions(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupAction]:
         if self.baseline == "periodic_keepwarm":
             ranked = self._periodic_keepwarm_ranked_intents(intents, workflow_index)
@@ -222,8 +279,7 @@ class MintController:
         else:
             ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
         unlimited = self.baseline in {"static_dag_unlimited", "mint_offline_unlimited", "periodic", "independent"}
-        budget = len(ranked) if unlimited else int(self.config.get("experiment", {}).get("warmup_budget", 1))
-        budget = max(0, budget)
+        budget = len(ranked) if unlimited else self._warmup_budget()
         actions: list[WarmupAction] = []
         for index, intent in enumerate(ranked):
             if index < budget:
