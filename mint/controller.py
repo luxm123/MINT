@@ -129,7 +129,7 @@ class MintController:
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
         if self.baseline == "path_aware_greedy":
-            actions = self._path_aware_greedy_actions(intents, selected_nodes)
+            actions = self._path_aware_greedy_actions(intents, self._observable_frontier())
         elif self.baseline == "oracle_path":
             actions = self._oracle_path_actions(intents, selected_nodes)
         elif self.baseline in {
@@ -145,10 +145,11 @@ class MintController:
         }:
             actions = self._static_baseline_actions(intents, workflow_index)
         else:
-            call_probability = {node: (1.0 if node in selected_nodes else 0.0) for node in self.dag.nodes}
+            call_probability = self._profile_call_probability()
             runtime_state = {
                 "now_sec": 0.0,
                 "call_probability": call_probability,
+                "frontier": self._observable_frontier(),
                 "hot_until": self._hot_until,
                 "path_benefit": {intent.logical_name: intent.criticality for intent in intents},
             }
@@ -227,15 +228,34 @@ class MintController:
     def _warmup_budget(self) -> int:
         return max(0, int(self.config.get("experiment", {}).get("warmup_budget", 1)))
 
-    def _path_aware_greedy_actions(self, intents: list[WarmupIntent], selected_nodes: list[str]) -> list[WarmupAction]:
-        selected = set(selected_nodes)
+    def _observable_frontier(self) -> list[str]:
+        return list(self.dag.entry_nodes)
+
+    def _profile_call_probability(self) -> dict[str, float]:
+        probabilities = {node: 1.0 for node in self.dag.nodes}
+        if self.dag.name == "branch":
+            for node in {"f2", "f3", "f4", "f5"} & set(self.dag.nodes):
+                probabilities[node] = 0.5
+        elif self.dag.name == "mixed":
+            for node in {"f2", "f3"} & set(self.dag.nodes):
+                probabilities[node] = 0.5
+        elif self.dag.name == "wide_branch":
+            for node in {"f2", "f3", "f4", "f5"} & set(self.dag.nodes):
+                probabilities[node] = 0.25
+        elif self.dag.name == "deep_mixed":
+            for node in {"f2", "f3", "f4", "f5"} & set(self.dag.nodes):
+                probabilities[node] = 0.5
+        return probabilities
+
+    def _path_aware_greedy_actions(self, intents: list[WarmupIntent], observable_nodes: list[str]) -> list[WarmupAction]:
+        observable = set(observable_nodes)
         now = monotonic_sec()
         budget = self._warmup_budget()
         actions: list[WarmupAction] = []
         candidates: list[WarmupIntent] = []
         for intent in intents:
-            if intent.logical_name not in selected:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_not_on_selected_path"))
+            if intent.logical_name not in observable:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_not_currently_observable"))
             elif self._hot_until.get(intent.logical_name, 0.0) > now:
                 actions.append(WarmupAction("cancel", intent, intent.offline_gain, "path_aware_already_hot"))
             else:

@@ -1,3 +1,4 @@
+import mint.controller as controller_mod
 from mint.controller import MintController
 from mint.workloads import get_workload
 import json
@@ -59,6 +60,7 @@ def test_path_aware_greedy_only_warms_selected_path_and_budget(tmp_path):
     invoked = {event["logical_name"] for event in events if event.get("event_type") == "invocation"}
     warmed = {event["logical_name"] for event in events if event.get("event_type") == "warmup"}
     assert warmed <= invoked
+    assert warmed == {"f1"}
     assert any(event.get("action") == "cancel" for event in events if event.get("event_type") == "scheduler_decision")
 
 
@@ -75,4 +77,29 @@ def test_oracle_path_only_warms_real_path_and_budget(tmp_path):
     invoked = {event["logical_name"] for event in events if event.get("event_type") == "invocation"}
     warmed = {event["logical_name"] for event in events if event.get("event_type") == "warmup"}
     assert warmed <= invoked
+    assert warmed != {"f1"}
     assert controller.planner_type == "oracle"
+
+
+def test_mint_markov_full_uses_profile_probabilities_not_full_selected_path(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_schedule(intents, runtime_state, budget, config):
+        captured["call_probability"] = runtime_state["call_probability"]
+        captured["frontier"] = runtime_state["frontier"]
+        return []
+
+    monkeypatch.setattr(controller_mod, "schedule_intents", fake_schedule)
+    dag = get_workload("wide_branch")
+    config = _config(tmp_path, "mint_markov_full")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_seed": 0, "profile_mismatch": False})
+    config["planner"] = {"type": "markov", "horizon": 5}
+    controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+    controller.run(1)
+
+    assert captured["frontier"] == ["f1"]
+    probabilities = captured["call_probability"]
+    assert {probabilities[node] for node in ["f2", "f3", "f4", "f5"]} == {0.25}
+    assert probabilities["f6"] == 1.0
+    assert probabilities["f7"] == 1.0
