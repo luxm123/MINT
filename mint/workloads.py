@@ -68,6 +68,9 @@ class WorkflowDAG:
         if self.name == "wide_branch":
             choices = ["f2", "f3", "f4", "f5"]
             return [choices[int(context.get("branch_index", 0)) % len(choices)]]
+        if self.name == "greedy_trap":
+            choices = ["f2", "f3", "f4"]
+            return [choices[int(context.get("branch_index", 0)) % len(choices)]]
         return self.successors[node]
 
 
@@ -143,6 +146,26 @@ WORKLOADS: dict[str, WorkflowDAG] = {
         entry_nodes=["f1"],
         terminal_nodes=["f8"],
         branch_rules={"f1": "context.branch == 'left' ? f2 -> f4 : f3 -> f5; f6 joins whichever branch was taken"},
+    ),
+    "greedy_trap": WorkflowDAG(
+        name="greedy_trap",
+        nodes=["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"],
+        edges=[
+            ("f1", "f2"),
+            ("f1", "f3"),
+            ("f1", "f4"),
+            ("f2", "f5"),
+            ("f3", "f5"),
+            ("f4", "f5"),
+            ("f5", "f6"),
+            ("f6", "f7"),
+            ("f7", "f8"),
+        ],
+        entry_nodes=["f1"],
+        terminal_nodes=["f8"],
+        branch_rules={
+            "f1": "runtime selects exactly one early branch f2/f3/f4; all branches converge to the critical suffix f5 -> f6 -> f7 -> f8"
+        },
     ),
 }
 

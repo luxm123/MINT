@@ -4,7 +4,7 @@ from mint.workloads import get_workload
 
 def _config(budget=2):
     return {
-        "aws": {"lambda_functions": {f"f{i}": f"mint-f{i}" for i in range(1, 6)}},
+        "aws": {"lambda_functions": {f"f{i}": f"mint-f{i}" for i in range(1, 9)}},
         "experiment": {"warmup_budget": budget},
         "platform": {"default_retention_sec": 300, "default_cold_start_ms": 800, "default_warm_duration_ms": 100},
         "planner": {
@@ -63,3 +63,15 @@ def test_value_iteration_runs_for_join():
     policy = analyzer.analyze()
     assert policy
     assert all(len(action.warmup_functions) <= 2 for action in policy.values())
+
+
+def test_greedy_trap_markov_transition_branches_then_converges():
+    dag = get_workload("greedy_trap")
+    model = MarkovTransitionModel(dag, _config())
+    initial = model.initial_state()
+    transitions = model.transition(initial, MarkovAction(tuple()))
+    assert len(transitions) == 3
+    assert {t.next_state.branch_path for t in transitions} == {"f2", "f3", "f4"}
+    assert all(t.next_state.frontier in {("f2",), ("f3",), ("f4",)} for t in transitions)
+    after_branch = model.transition(transitions[0].next_state, MarkovAction(tuple()))[0].next_state
+    assert after_branch.frontier == ("f5",)

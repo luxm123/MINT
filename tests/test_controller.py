@@ -6,7 +6,7 @@ import json
 
 def _config(tmp_path, baseline):
     return {
-        "aws": {"lambda_functions": {f"f{i}": f"mint-f{i}" for i in range(1, 6)}},
+        "aws": {"lambda_functions": {f"f{i}": f"mint-f{i}" for i in range(1, 9)}},
         "experiment": {"baseline": baseline, "warmup_budget": 2, "output_dir": str(tmp_path / baseline)},
         "platform": {"default_retention_sec": 300, "default_cold_start_ms": 800, "default_warm_duration_ms": 100},
         "scheduler": {"enable_delay": True, "enable_cancel": True, "enable_replace": True, "gain_threshold": 0.0},
@@ -124,3 +124,38 @@ def test_mint_markov_full_uses_profile_probabilities_not_full_selected_path(tmp_
     assert {probabilities[node] for node in ["f2", "f3", "f4", "f5"]} == {0.25}
     assert probabilities["f6"] == 1.0
     assert probabilities["f7"] == 1.0
+
+
+def test_greedy_trap_workload_has_profile_branch_and_common_suffix():
+    dag = get_workload("greedy_trap")
+    assert dag.entry_nodes == ["f1"]
+    assert {"f2", "f3", "f4"} <= set(dag.successors["f1"])
+    assert dag.predecessors["f5"] == ["f2", "f3", "f4"]
+    assert dag.successors["f7"] == ["f8"]
+
+
+def test_greedy_trap_mint_and_path_aware_targets_differ_without_path_leak(tmp_path):
+    dag = get_workload("greedy_trap")
+    common_exp = {"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True, "timing_jitter_ms": 800}
+
+    greedy_config = _config(tmp_path, "path_aware_greedy")
+    greedy_config["experiment"].update(common_exp)
+    MintController(greedy_config, dag=dag, baseline="path_aware_greedy", dry_run=True).run(1)
+
+    mint_config = _config(tmp_path, "mint_markov_full")
+    mint_config["experiment"].update(common_exp)
+    mint_config["planner"] = {"type": "markov", "horizon": 6}
+    MintController(mint_config, dag=dag, baseline="mint_markov_full", dry_run=True).run(1)
+
+    greedy_events = _events(tmp_path / "path_aware_greedy" / "events.jsonl")
+    mint_events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    greedy_warmups = [event["logical_name"] for event in greedy_events if event.get("event_type") == "warmup"]
+    mint_warmups = [event["logical_name"] for event in mint_events if event.get("event_type") == "warmup"]
+    assert greedy_warmups != mint_warmups
+    assert any(node in {"f2", "f3", "f4"} for node in greedy_warmups)
+    assert any(node in {"f5", "f6", "f7", "f8"} for node in mint_warmups)
+
+    greedy_decisions = [event for event in greedy_events if event.get("event_type") == "scheduler_decision"]
+    mint_decisions = [event for event in mint_events if event.get("event_type") == "scheduler_decision"]
+    assert sum(1 for event in greedy_decisions if event.get("action") == "execute") <= 2
+    assert any(event.get("action") in {"cancel", "replace"} for event in mint_decisions)

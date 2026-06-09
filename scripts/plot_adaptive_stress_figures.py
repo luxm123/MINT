@@ -13,7 +13,7 @@ DEFAULT_RESULTS_DIR = ROOT / "results" / "aws_adaptive_stress_main_20260607_1410
 FIXED_BASELINES = ["periodic_keepwarm", "static_dag", "orion_like"]
 METHOD_ORDER = ["no_warmup", "best_fixed", "path_aware_greedy", "mint_markov_full", "oracle_path"]
 BUDGET_METHOD_ORDER = ["best_fixed", "path_aware_greedy", "mint_markov_full", "oracle_path"]
-WORKLOADS = ["wide_branch", "deep_mixed"]
+WORKLOADS = ["wide_branch", "deep_mixed", "greedy_trap"]
 DISPLAY = {
     "no_warmup": "No warmup",
     "best_fixed": "Best-fixed",
@@ -110,6 +110,8 @@ def compute_best_fixed(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_adaptive_tables(summary: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    workloads = [name for name in WORKLOADS if name in set(summary["dag"])]
+    workloads.extend(name for name in summary["dag"].drop_duplicates().tolist() if name not in workloads)
     best_fixed = compute_best_fixed(summary)
     combined = pd.concat([summary, best_fixed], ignore_index=True, sort=False)
     main = combined[combined["baseline"].isin(METHOD_ORDER)].copy()
@@ -156,15 +158,15 @@ def build_adaptive_tables(summary: pd.DataFrame) -> dict[str, pd.DataFrame]:
             delay_count=("delay_count", "sum"),
         )
     )
-    by_workload["_workload_order"] = by_workload["dag"].map({name: idx for idx, name in enumerate(WORKLOADS)})
+    by_workload["_workload_order"] = by_workload["dag"].map({name: idx for idx, name in enumerate(workloads)})
     by_workload["_method_order"] = by_workload["baseline"].map({name: idx for idx, name in enumerate(METHOD_ORDER)})
     by_workload = by_workload.sort_values(["_workload_order", "_method_order"]).drop(columns=["_workload_order", "_method_order"])
 
     budget = main[main["baseline"].isin(METHOD_ORDER)].copy()
-    budget["_workload_order"] = budget["dag"].map({name: idx for idx, name in enumerate(WORKLOADS)})
+    budget["_workload_order"] = budget["dag"].map({name: idx for idx, name in enumerate(workloads)})
     budget["_method_order"] = budget["baseline"].map({name: idx for idx, name in enumerate(METHOD_ORDER)})
     budget = budget.sort_values(["_workload_order", "_method_order", "budget"]).drop(columns=["_workload_order", "_method_order"])
-    return {"main": agg, "by_workload": by_workload, "budget": budget}
+    return {"main": agg, "by_workload": by_workload, "budget": budget, "workloads": workloads}
 
 
 def write_tables(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path]:
@@ -290,8 +292,9 @@ def plot_figure1(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path
 
 def plot_figure2(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path]:
     view = tables["by_workload"]
-    pivot = view.pivot(index="dag", columns="baseline", values="p95").reindex(WORKLOADS)
-    x = np.arange(len(WORKLOADS))
+    workloads = tables["workloads"]
+    pivot = view.pivot(index="dag", columns="baseline", values="p95").reindex(workloads)
+    x = np.arange(len(workloads))
     width = 0.15
     fig, ax = plt.subplots(figsize=(8.8, 4.1))
     for idx, baseline in enumerate(METHOD_ORDER):
@@ -306,7 +309,7 @@ def plot_figure2(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path
             label=DISPLAY[baseline],
         )
     ax.set_ylabel("P95 latency (ms)")
-    ax.set_xticks(x, [name.replace("_", " ") for name in WORKLOADS])
+    ax.set_xticks(x, [name.replace("_", " ") for name in workloads])
     ax.set_ylim(0, float(pivot.max().max()) * 1.2)
     ax.legend(ncol=5, frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.02))
     ax.grid(axis="y")
@@ -316,9 +319,11 @@ def plot_figure2(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path
 
 def plot_figure3(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path]:
     budget = tables["budget"][tables["budget"]["baseline"].isin(BUDGET_METHOD_ORDER)]
-    fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.0))
+    workloads = tables["workloads"]
+    fig, axes = plt.subplots(1, len(workloads), figsize=(5.6 * len(workloads), 4.0), squeeze=False)
+    axes = axes[0]
     markers = {"best_fixed": "o", "path_aware_greedy": "s", "mint_markov_full": "*", "oracle_path": "D"}
-    for ax, workload in zip(axes, WORKLOADS):
+    for ax, workload in zip(axes, workloads):
         sub = budget[budget["dag"] == workload]
         for baseline in BUDGET_METHOD_ORDER:
             line = sub[sub["baseline"] == baseline].sort_values("budget")
@@ -331,7 +336,7 @@ def plot_figure3(tables: dict[str, pd.DataFrame], figure_dir: Path) -> list[Path
                 linewidth=2.6 if baseline == "mint_markov_full" else 1.5,
                 label=DISPLAY[baseline],
             )
-        ax.set_title(f"({chr(ord('a') + WORKLOADS.index(workload))}) {workload}")
+        ax.set_title(f"({chr(ord('a') + workloads.index(workload))}) {workload}")
         ax.set_xlabel("Budget B")
         ax.set_ylabel("P95 latency (ms)")
         ax.set_xticks([1, 2, 3], ["B=1", "B=2", "B=3"])

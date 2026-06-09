@@ -118,6 +118,9 @@ class MarkovTransitionModel:
         if self.dag.name == "wide_branch" and "f1" in called and current_branch is None:
             probability = 1.0 / 4.0
             return [(probability, branch) for branch in ("f2", "f3", "f4", "f5")]
+        if self.dag.name == "greedy_trap" and "f1" in called and current_branch is None:
+            probability = 1.0 / 3.0
+            return [(probability, branch) for branch in ("f2", "f3", "f4")]
         return [(1.0, current_branch)]
 
     def _next_frontier(self, completed: tuple[str, ...], called: tuple[str, ...], branch_path: str | None) -> tuple[str, ...]:
@@ -130,6 +133,8 @@ class MarkovTransitionModel:
                 candidates.update(["f2"] if branch_path == "left" else ["f3"])
             elif self.dag.name == "wide_branch" and node == "f1":
                 candidates.update([branch_path or "f2"])
+            elif self.dag.name == "greedy_trap" and node == "f1":
+                candidates.update([branch_path or "f2"])
             else:
                 candidates.update(self.dag.successors[node])
         next_nodes = []
@@ -138,6 +143,9 @@ class MarkovTransitionModel:
             if node in completed_set:
                 continue
             if self.dag.name == "mixed" and node == "f4" and any(parent in completed_set for parent in preds[node]):
+                next_nodes.append(node)
+                continue
+            elif self.dag.name == "greedy_trap" and node == "f5" and any(parent in completed_set for parent in preds[node]):
                 next_nodes.append(node)
                 continue
             elif self.dag.name in {"wide_branch", "deep_mixed"} and node == "f6" and any(parent in completed_set for parent in preds[node]):
@@ -175,6 +183,8 @@ class MarkovTransitionModel:
                 children = ["f2"] if state.branch_path == "left" else ["f3"] if state.branch_path == "right" else self.dag.successors[node]
             elif self.dag.name == "wide_branch" and node == "f1":
                 children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4", "f5"} else self.dag.successors[node]
+            elif self.dag.name == "greedy_trap" and node == "f1":
+                children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4"} else self.dag.successors[node]
             else:
                 children = self.dag.successors[node]
             for child in children:

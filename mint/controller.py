@@ -151,7 +151,7 @@ class MintController:
                 "call_probability": call_probability,
                 "frontier": self._observable_frontier(),
                 "hot_until": self._hot_until,
-                "path_benefit": {intent.logical_name: intent.criticality for intent in intents},
+                "path_benefit": self._runtime_path_benefit(intents),
             }
             actions = schedule_intents(
                 intents,
@@ -245,7 +245,25 @@ class MintController:
         elif self.dag.name == "deep_mixed":
             for node in {"f2", "f3", "f4", "f5"} & set(self.dag.nodes):
                 probabilities[node] = 0.5
+        elif self.dag.name == "greedy_trap":
+            for node in {"f2", "f3", "f4"} & set(self.dag.nodes):
+                probabilities[node] = 1.0 / 3.0
         return probabilities
+
+    def _runtime_path_benefit(self, intents: list[WarmupIntent]) -> dict[str, float]:
+        if self.dag.name != "greedy_trap":
+            return {intent.logical_name: intent.criticality for intent in intents}
+        weights = {
+            "f1": 1.0,
+            "f2": 1.2,
+            "f3": 1.15,
+            "f4": 1.1,
+            "f5": 4.8,
+            "f6": 4.3,
+            "f7": 3.8,
+            "f8": 3.2,
+        }
+        return {intent.logical_name: weights.get(intent.logical_name, intent.criticality) for intent in intents}
 
     def _path_aware_greedy_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
         call_probability = self._profile_call_probability()
@@ -352,6 +370,8 @@ class MintController:
                     ready.append(child)
                 elif self.dag.name == "deep_mixed" and child == "f6" and any(parent in seen for parent in parents):
                     ready.append(child)
+                elif self.dag.name == "greedy_trap" and child == "f5" and any(parent in seen for parent in parents):
+                    ready.append(child)
                 elif all(parent in seen or parent not in completed + ready for parent in parents if self.dag.name == "branch"):
                     ready.append(child)
                 elif all(parent in seen for parent in parents):
@@ -366,11 +386,17 @@ class MintController:
             if mismatch:
                 branch_index = (branch_index * 2 + 1) % 4
             return {"branch_index": branch_index}
+        if self.dag.name == "greedy_trap":
+            mismatch = bool(self.config.get("experiment", {}).get("profile_mismatch", False))
+            branch_index = (index + branch_seed) % 3
+            if mismatch:
+                branch_index = (branch_index * 2 + 1) % 3
+            return {"branch_index": branch_index}
         return {"branch": "left" if (index + branch_seed) % 2 == 0 else "right"}
 
     def _timing_jitter_ms(self, index: int, stage: int) -> float:
         jitter = float(self.config.get("experiment", {}).get("timing_jitter_ms", 0.0))
-        if jitter <= 0 or self.dag.name != "deep_mixed":
+        if jitter <= 0 or self.dag.name not in {"deep_mixed", "greedy_trap"}:
             return 0.0
         return round(((index + stage) % 3 - 1) * jitter / 2.0, 3)
 
