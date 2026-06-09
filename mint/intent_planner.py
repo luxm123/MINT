@@ -35,28 +35,6 @@ def _node_call_probability(dag: WorkflowDAG, node: str) -> float:
     return 1.0
 
 
-def _greedy_trap_offline_gain(node: str, stage: int, cold_ms: float, warm_ms: float) -> float | None:
-    # The trap profile makes early branch candidates look locally attractive to a
-    # one-step greedy policy, while the converged suffix is better for a
-    # finite-horizon policy under a small warmup budget.
-    local_branch_gain = {
-        "f2": cold_ms * 3.10 - warm_ms,
-        "f3": cold_ms * 3.00 - warm_ms,
-        "f4": cold_ms * 2.90 - warm_ms,
-    }
-    long_horizon_gain = {
-        "f5": cold_ms * 0.95 - warm_ms,
-        "f6": cold_ms * 0.88 - warm_ms,
-        "f7": cold_ms * 0.78 - warm_ms,
-        "f8": cold_ms * 0.68 - warm_ms,
-    }
-    entry_gain = {"f1": cold_ms * 0.70 - warm_ms}
-    values = {**entry_gain, **local_branch_gain, **long_horizon_gain}
-    if node not in values:
-        return None
-    return values[node] - stage * 5.0
-
-
 def plan_heuristic_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[WarmupIntent]:
     """Create offline warmup intents.
 
@@ -84,8 +62,6 @@ def plan_heuristic_intents(dag: WorkflowDAG, config: dict[str, Any]) -> list[War
         p_cold = 0.8 if stage == 0 else 0.6
         validity = min(1.0, default_retention / max(default_retention, planned_time + 1.0))
         offline_gain = (p_call * p_cold * validity * criticality * cold_ms) - warm_ms
-        if dag.name == "greedy_trap":
-            offline_gain = _greedy_trap_offline_gain(node, stage, cold_ms, warm_ms) or offline_gain
         intents.append(
             WarmupIntent(
                 intent_id=new_id("intent"),

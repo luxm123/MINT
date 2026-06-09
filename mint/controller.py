@@ -251,19 +251,54 @@ class MintController:
         return probabilities
 
     def _runtime_path_benefit(self, intents: list[WarmupIntent]) -> dict[str, float]:
-        if self.dag.name != "greedy_trap":
-            return {intent.logical_name: intent.criticality for intent in intents}
-        weights = {
-            "f1": 1.0,
-            "f2": 1.2,
-            "f3": 1.15,
-            "f4": 1.1,
-            "f5": 4.8,
-            "f6": 4.3,
-            "f7": 3.8,
-            "f8": 3.2,
-        }
-        return {intent.logical_name: weights.get(intent.logical_name, intent.criticality) for intent in intents}
+        stages = self.dag.stages()
+        downstream = self.dag.downstream_counts()
+        predecessors = self.dag.predecessors
+        call_probability = self._profile_call_probability()
+        convergence_nodes = {node for node, parents in predecessors.items() if len(parents) > 1}
+        max_downstream = max(downstream.values() or [1])
+        max_stage = max(stages.values() or [1])
+        max_fan_in = max((len(parents) for parents in predecessors.values()), default=1)
+        max_offline_gain = max((max(0.0, intent.offline_gain) for intent in intents), default=1.0) or 1.0
+        cold_ms = float(self.config.get("platform", {}).get("default_cold_start_ms", 800))
+        cold_scale = max(cold_ms / 800.0, 0.1)
+
+        benefits: dict[str, float] = {}
+        for intent in intents:
+            node = intent.logical_name
+            p_call = float(call_probability.get(node, 1.0))
+            downstream_score = downstream.get(node, 0) / max(max_downstream, 1)
+            stage_score = stages.get(node, intent.stage) / max(max_stage, 1)
+            fan_in_score = max(0, len(predecessors.get(node, [])) - 1) / max(max_fan_in - 1, 1)
+            suffix_score = 1.0 if self._has_convergence_ancestor(node, convergence_nodes) else 0.0
+            offline_score = max(0.0, intent.offline_gain) / max_offline_gain
+            reachability_score = 0.5 + 0.5 * min(max(p_call, 0.0), 1.0)
+            structural_value = (
+                1.0
+                + 1.2 * downstream_score
+                + 0.8 * stage_score
+                + 1.4 * suffix_score
+                + 0.8 * fan_in_score
+                + 0.5 * offline_score
+            )
+            benefits[node] = round(structural_value * reachability_score * cold_scale, 4)
+        return benefits
+
+    def _has_convergence_ancestor(self, node: str, convergence_nodes: set[str]) -> bool:
+        if node in convergence_nodes:
+            return True
+        reverse = self.dag.predecessors
+        queue = list(reverse.get(node, []))
+        seen: set[str] = set()
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            if current in convergence_nodes:
+                return True
+            queue.extend(reverse.get(current, []))
+        return False
 
     def _path_aware_greedy_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
         call_probability = self._profile_call_probability()
@@ -273,7 +308,7 @@ class MintController:
         candidates: list[tuple[WarmupIntent, float]] = []
         for intent in intents:
             p_call = float(call_probability.get(intent.logical_name, 0.0))
-            expected_gain = round(intent.offline_gain * p_call, 4)
+            expected_gain = self._path_aware_expected_gain(intent, p_call)
             if p_call <= 0.0:
                 actions.append(WarmupAction("cancel", intent, expected_gain, "path_aware_not_profile_reachable"))
             elif self._hot_until.get(intent.logical_name, 0.0) > now:
@@ -288,6 +323,13 @@ class MintController:
             else:
                 actions.append(WarmupAction("replace", intent, expected_gain, "path_aware_greedy_budget_exceeded"))
         return actions
+
+    def _path_aware_expected_gain(self, intent: WarmupIntent, p_call: float) -> float:
+        gain = intent.offline_gain * p_call
+        if p_call < 1.0 and any(len(self.dag.successors[parent]) > 1 for parent in self.dag.predecessors.get(intent.logical_name, [])):
+            cold_ms = float(self.config.get("platform", {}).get("default_cold_start_ms", 800))
+            gain += cold_ms * p_call * (1.6 + (1.0 - p_call))
+        return round(gain, 4)
 
     def _oracle_path_actions(self, intents: list[WarmupIntent], selected_nodes: list[str]) -> list[WarmupAction]:
         selected = set(selected_nodes)
