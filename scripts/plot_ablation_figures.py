@@ -18,21 +18,21 @@ import pandas as pd
 
 METHOD_ORDER = [
     "path_aware_greedy",
-    "mint_markov_offline",
+    "mint_markov_no_runtime_reval",
     "mint_markov_no_long_horizon",
     "mint_markov_full",
     "oracle_path",
 ]
 DISPLAY = {
     "path_aware_greedy": "Path-aware greedy",
-    "mint_markov_offline": "MINT w/o runtime rescheduling",
+    "mint_markov_no_runtime_reval": "MINT w/o runtime re-evaluation",
     "mint_markov_no_long_horizon": "MINT w/o long-horizon benefit",
     "mint_markov_full": "MINT",
     "oracle_path": "Oracle",
 }
 COLORS = {
     "path_aware_greedy": "#4e79a7",
-    "mint_markov_offline": "#b07aa1",
+    "mint_markov_no_runtime_reval": "#b07aa1",
     "mint_markov_no_long_horizon": "#f28e2b",
     "mint_markov_full": "#d62728",
     "oracle_path": "#59a14f",

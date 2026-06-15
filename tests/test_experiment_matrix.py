@@ -115,7 +115,7 @@ def test_ablation_baselines_generate_matrix_events_and_figures(tmp_path):
             "greedy_trap",
             "--baselines",
             "path_aware_greedy",
-            "mint_markov_offline",
+            "mint_markov_no_runtime_reval",
             "mint_markov_no_long_horizon",
             "mint_markov_full",
             "oracle_path",
@@ -141,7 +141,7 @@ def test_ablation_baselines_generate_matrix_events_and_figures(tmp_path):
     assert len(rows) == 10
     assert set(rows["baseline"]) == {
         "path_aware_greedy",
-        "mint_markov_offline",
+        "mint_markov_no_runtime_reval",
         "mint_markov_no_long_horizon",
         "mint_markov_full",
         "oracle_path",

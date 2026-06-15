@@ -163,6 +163,31 @@ def test_mint_markov_offline_executes_only_offline_top_budget_without_runtime_re
     assert not any(event["action"] in {"delay", "cancel"} for event in decisions)
 
 
+def test_mint_markov_no_runtime_reval_uses_offline_rank_budget_and_hot_guard(tmp_path, monkeypatch):
+    def fail_schedule(*args, **kwargs):
+        raise AssertionError("no-runtime ablation must not invoke runtime scheduler")
+
+    monkeypatch.setattr(controller_mod, "schedule_intents", fail_schedule)
+    dag = get_workload("greedy_trap")
+    config = _config(tmp_path, "mint_markov_no_runtime_reval")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True})
+    config["planner"] = {"type": "markov", "horizon": 6}
+    controller = MintController(config, dag=dag, baseline="mint_markov_no_runtime_reval", dry_run=True)
+    controller.run(2)
+
+    events = _events(tmp_path / "mint_markov_no_runtime_reval" / "events.jsonl")
+    run_ids = [event["run_id"] for event in events if event.get("event_type") == "workflow_summary"]
+    assert len(run_ids) == 2
+    for run_id in run_ids:
+        decisions = [event for event in events if event.get("event_type") == "scheduler_decision" and event["run_id"] == run_id]
+        executes = [event for event in decisions if event["action"] == "execute"]
+        assert len(executes) <= 2
+        assert not any(event["action"] == "replace" for event in decisions)
+    second_run_decisions = [event for event in events if event.get("event_type") == "scheduler_decision" and event["run_id"] == run_ids[1]]
+    assert any(event["action"] == "cancel" and event["action_reason"] == "mint_markov_no_runtime_reval_already_hot" for event in second_run_decisions)
+
+
 def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_benefit(tmp_path, monkeypatch):
     captured = {}
 
@@ -189,6 +214,37 @@ def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_b
     assert runtime_state["hot_until"] == {}
     assert runtime_state["call_probability"]["f2"] == 1.0 / 3.0
     assert set(runtime_state["path_benefit"]) <= set(dag.nodes)
+
+
+def test_mint_markov_full_and_no_long_horizon_share_scheduler_inputs_except_path_benefit(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_schedule(intents, runtime_state, budget, config):
+        baseline = config["experiment"]["baseline"]
+        captured[baseline] = {
+            "intent_names": [intent.logical_name for intent in intents],
+            "runtime_state": runtime_state,
+            "budget": budget,
+        }
+        return []
+
+    monkeypatch.setattr(controller_mod, "schedule_intents", fake_schedule)
+    dag = get_workload("deep_mixed")
+    common_exp = {"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True, "timing_jitter_ms": 800}
+    for baseline in ("mint_markov_full", "mint_markov_no_long_horizon"):
+        config = _config(tmp_path, baseline)
+        config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+        config["experiment"].update(common_exp)
+        config["planner"] = {"type": "markov", "horizon": 6}
+        MintController(config, dag=dag, baseline=baseline, dry_run=True).run(1)
+
+    full = captured["mint_markov_full"]
+    no_long = captured["mint_markov_no_long_horizon"]
+    assert full["intent_names"] == no_long["intent_names"]
+    assert full["budget"] == no_long["budget"] == 2
+    for key in ("now_sec", "call_probability", "frontier", "hot_until"):
+        assert full["runtime_state"][key] == no_long["runtime_state"][key]
+    assert full["runtime_state"]["path_benefit"] != no_long["runtime_state"]["path_benefit"]
 
 
 def test_greedy_trap_workload_has_profile_branch_and_common_suffix():
@@ -247,3 +303,25 @@ def test_mint_no_long_horizon_and_full_rank_different_targets_on_greedy_trap(tmp
     assert no_long_warmups != full_warmups
     assert "f1" in no_long_warmups
     assert any(node in {"f5", "f6", "f7", "f8"} for node in full_warmups)
+
+
+def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp_path):
+    dag = get_workload("greedy_trap")
+    common_exp = {"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True, "timing_jitter_ms": 800}
+    variants = ("mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full")
+    warmups = {}
+    actions = {}
+    for baseline in variants:
+        config = _config(tmp_path, baseline)
+        config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+        config["experiment"].update(common_exp)
+        config["planner"] = {"type": "markov", "horizon": 6}
+        MintController(config, dag=dag, baseline=baseline, dry_run=True).run(1)
+        events = _events(tmp_path / baseline / "events.jsonl")
+        warmups[baseline] = [event["logical_name"] for event in events if event.get("event_type") == "warmup"]
+        actions[baseline] = [event["action"] for event in events if event.get("event_type") == "scheduler_decision"]
+
+    assert warmups["mint_markov_no_runtime_reval"] != warmups["mint_markov_full"]
+    assert warmups["mint_markov_no_long_horizon"] != warmups["mint_markov_full"]
+    assert "replace" not in actions["mint_markov_no_runtime_reval"]
+    assert "replace" in actions["mint_markov_full"]

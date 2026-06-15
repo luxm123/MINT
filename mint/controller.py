@@ -30,6 +30,7 @@ SUPPORTED_BASELINES = {
     "mint_offline_unlimited",
     "mint_full",
     "mint_markov_offline",
+    "mint_markov_no_runtime_reval",
     "mint_markov_no_long_horizon",
     "mint_markov_full",
 }
@@ -146,6 +147,8 @@ class MintController:
             actions = self._static_baseline_actions(intents, workflow_index)
         elif self.baseline == "mint_markov_offline":
             actions = self._markov_offline_actions(intents)
+        elif self.baseline == "mint_markov_no_runtime_reval":
+            actions = self._markov_no_runtime_reval_actions(intents)
         else:
             call_probability = self._profile_call_probability()
             if self.baseline == "mint_markov_no_long_horizon":
@@ -205,7 +208,7 @@ class MintController:
         return count
 
     def _planner_type_for_baseline(self) -> str:
-        if self.baseline in {"mint_markov_offline", "mint_markov_no_long_horizon", "mint_markov_full"}:
+        if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
             return "markov"
         if self.baseline in {"mint_offline", "mint_full"}:
             return "heuristic"
@@ -225,7 +228,7 @@ class MintController:
         return planner_config
 
     def _intent_planner_type(self) -> str:
-        if self.baseline in {"mint_markov_offline", "mint_markov_no_long_horizon", "mint_markov_full"}:
+        if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
             return "markov"
         if self.baseline in {"mint_offline", "mint_full"}:
             return "heuristic"
@@ -298,8 +301,7 @@ class MintController:
         benefits: dict[str, float] = {}
         for intent in intents:
             local_gain = max(0.0, intent.offline_gain) / max_offline_gain
-            reachability = min(max(float(call_probability.get(intent.logical_name, 1.0)), 0.0), 1.0)
-            benefits[intent.logical_name] = round(max(local_gain, 0.05) * max(reachability, 0.05) * cold_scale, 4)
+            benefits[intent.logical_name] = round(max(local_gain, 0.05) * cold_scale, 4)
         return benefits
 
     def _has_convergence_ancestor(self, node: str, convergence_nodes: set[str]) -> bool:
@@ -380,6 +382,22 @@ class MintController:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, "mint_markov_offline_top_intent_within_budget"))
             else:
                 actions.append(WarmupAction("replace", intent, intent.offline_gain, "mint_markov_offline_budget_exceeded"))
+        return actions
+
+    def _markov_no_runtime_reval_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        budget = self._warmup_budget()
+        now = monotonic_sec()
+        executed = 0
+        actions: list[WarmupAction] = []
+        for intent in ranked:
+            if self._hot_until.get(intent.logical_name, 0.0) > now:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "mint_markov_no_runtime_reval_already_hot"))
+            elif executed < budget:
+                actions.append(WarmupAction("execute", intent, intent.offline_gain, "mint_markov_no_runtime_reval_offline_rank_within_budget"))
+                executed += 1
+            else:
+                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "mint_markov_no_runtime_reval_budget_exceeded"))
         return actions
 
     def _static_baseline_actions(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupAction]:
