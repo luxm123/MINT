@@ -95,6 +95,7 @@ def effective_planner_for_baseline(baseline: str) -> str:
         "mint_offline_unlimited": "heuristic",
         "mint_full": "heuristic",
         "mint_markov_offline": "markov",
+        "mint_markov_no_long_horizon": "markov",
         "mint_markov_full": "markov",
     }
     return mapping.get(baseline, "unknown")

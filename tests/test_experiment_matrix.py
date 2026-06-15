@@ -1,9 +1,11 @@
 import json
+from pathlib import Path
 
 import pandas as pd
 
 from scripts import run_experiment_matrix
 from scripts import run_delay_shift_experiment
+from scripts import plot_ablation_figures
 from scripts.prepare_paper_tables import prepare_tables
 
 
@@ -101,6 +103,70 @@ def test_experiment_matrix_defaults_to_dry_run_without_confirm(tmp_path):
     assert rc == 0
     manifest = json.loads((output_root / "experiment_manifest.json").read_text(encoding="utf-8"))
     assert manifest["dry_run"] is True
+
+
+def test_ablation_baselines_generate_matrix_events_and_figures(tmp_path):
+    output_root = tmp_path / "ablation_matrix"
+    rc = run_experiment_matrix.main(
+        [
+            "--config",
+            "configs/mint_aws.yaml",
+            "--dags",
+            "greedy_trap",
+            "--baselines",
+            "path_aware_greedy",
+            "mint_markov_offline",
+            "mint_markov_no_long_horizon",
+            "mint_markov_full",
+            "oracle_path",
+            "--budgets",
+            "1",
+            "2",
+            "--repetitions",
+            "1",
+            "--cooldown-sec",
+            "0",
+            "--profile-mismatch",
+            "--timing-jitter-ms",
+            "800",
+            "--branch-seed",
+            "42",
+            "--dry-run",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+    assert rc == 0
+    rows = pd.read_csv(output_root / "summary_matrix.csv")
+    assert len(rows) == 10
+    assert set(rows["baseline"]) == {
+        "path_aware_greedy",
+        "mint_markov_offline",
+        "mint_markov_no_long_horizon",
+        "mint_markov_full",
+        "oracle_path",
+    }
+    assert (output_root / "failed_runs.jsonl").read_text(encoding="utf-8") == ""
+    assert all(rows["execute_count"] >= rows["total_warmup"])
+    assert all(rows["replace_count"] >= 0)
+    for output_dir in rows["output_dir"]:
+        assert (output_root / "summary_matrix.csv").exists()
+        path = Path(output_dir)
+        assert (path / "events.jsonl").exists()
+        assert (path / "summary.json").exists()
+    figure_dir = output_root / "ablation_figures"
+    plot_rc = plot_ablation_figures.main(["--matrix-csv", str(output_root / "summary_matrix.csv"), "--output-dir", str(figure_dir)])
+    assert plot_rc == 0
+    for name in [
+        "figure_ablation_p95_by_workload.png",
+        "figure_ablation_p95_by_workload.pdf",
+        "figure_ablation_p95_by_workload.svg",
+        "figure_ablation_warmup_efficiency.png",
+        "figure_ablation_warmup_efficiency.pdf",
+        "figure_ablation_warmup_efficiency.svg",
+        "table_ablation_summary.csv",
+    ]:
+        assert (figure_dir / name).exists()
 
 
 def test_prepare_paper_tables_from_small_matrix_csv(tmp_path):

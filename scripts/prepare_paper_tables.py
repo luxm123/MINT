@@ -45,6 +45,7 @@ def _ensure_effective_planner(df: pd.DataFrame) -> pd.DataFrame:
         "mint_offline": "heuristic",
         "mint_full": "heuristic",
         "mint_markov_offline": "markov",
+        "mint_markov_no_long_horizon": "markov",
         "mint_markov_full": "markov",
     }
     df = df.copy()

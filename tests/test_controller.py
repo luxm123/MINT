@@ -101,6 +101,21 @@ def test_oracle_path_only_warms_real_path_and_budget(tmp_path):
     assert controller.planner_type == "oracle"
 
 
+def test_oracle_path_can_use_selected_nodes_for_decision(tmp_path):
+    dag = get_workload("wide_branch")
+    config = _config(tmp_path, "oracle_path")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    controller = MintController(config, dag=dag, baseline="oracle_path", dry_run=True)
+    intents = controller._planner_config()
+    planned = controller_mod.plan_intents(dag, intents)
+
+    actions = controller._oracle_path_actions(planned, ["f1", "f4", "f6", "f7"])
+    executed = [action.intent.logical_name for action in actions if action.action_type == "execute"]
+    cancelled = [action.intent.logical_name for action in actions if action.action_type == "cancel"]
+    assert set(executed) <= {"f1", "f4", "f6", "f7"}
+    assert any(node not in {"f1", "f4", "f6", "f7"} for node in cancelled)
+
+
 def test_mint_markov_full_uses_profile_probabilities_not_full_selected_path(tmp_path, monkeypatch):
     captured = {}
 
@@ -123,6 +138,57 @@ def test_mint_markov_full_uses_profile_probabilities_not_full_selected_path(tmp_
     assert {probabilities[node] for node in ["f2", "f3", "f4", "f5"]} == {0.25}
     assert probabilities["f6"] == 1.0
     assert probabilities["f7"] == 1.0
+
+
+def test_mint_markov_offline_executes_only_offline_top_budget_without_runtime_rescheduling(tmp_path, monkeypatch):
+    def fail_schedule(*args, **kwargs):
+        raise AssertionError("offline ablation must not invoke runtime scheduler")
+
+    monkeypatch.setattr(controller_mod, "schedule_intents", fail_schedule)
+    dag = get_workload("greedy_trap")
+    config = _config(tmp_path, "mint_markov_offline")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True})
+    config["planner"] = {"type": "markov", "horizon": 6}
+    controller = MintController(config, dag=dag, baseline="mint_markov_offline", dry_run=True)
+    controller.run(1)
+
+    events = _events(tmp_path / "mint_markov_offline" / "events.jsonl")
+    executed = [event["logical_name"] for event in events if event.get("event_type") == "warmup"]
+    decisions = [event for event in events if event.get("event_type") == "scheduler_decision"]
+    planned = controller_mod.plan_intents(dag, controller._planner_config())
+    expected = [intent.logical_name for intent in sorted(planned, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))[:2]]
+    assert executed == expected
+    assert all(event["action_reason"].startswith("mint_markov_offline_") for event in decisions)
+    assert not any(event["action"] in {"delay", "cancel"} for event in decisions)
+
+
+def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_benefit(tmp_path, monkeypatch):
+    captured = {}
+
+    def fail_structural_benefit(self, intents):
+        raise AssertionError("no-long-horizon ablation must not compute structural long-horizon benefit")
+
+    def fake_schedule(intents, runtime_state, budget, config):
+        captured["runtime_state"] = runtime_state
+        captured["budget"] = budget
+        return [controller_mod.WarmupAction("execute", intents[0], 1.0, "test_runtime_execute")]
+
+    monkeypatch.setattr(MintController, "_runtime_path_benefit", fail_structural_benefit)
+    monkeypatch.setattr(controller_mod, "schedule_intents", fake_schedule)
+    dag = get_workload("greedy_trap")
+    config = _config(tmp_path, "mint_markov_no_long_horizon")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2})
+    config["planner"] = {"type": "markov", "horizon": 6}
+    MintController(config, dag=dag, baseline="mint_markov_no_long_horizon", dry_run=True).run(1)
+
+    runtime_state = captured["runtime_state"]
+    assert captured["budget"] == 2
+    assert runtime_state["frontier"] == ["f1"]
+    assert runtime_state["hot_until"] == {}
+    assert runtime_state["call_probability"]["f2"] == 1.0 / 3.0
+    assert set(runtime_state["path_benefit"]) <= set(dag.nodes)
 
 
 def test_greedy_trap_workload_has_profile_branch_and_common_suffix():
@@ -158,3 +224,26 @@ def test_greedy_trap_mint_and_path_aware_targets_differ_without_path_leak(tmp_pa
     mint_decisions = [event for event in mint_events if event.get("event_type") == "scheduler_decision"]
     assert sum(1 for event in greedy_decisions if event.get("action") == "execute") <= 2
     assert any(event.get("action") in {"cancel", "replace"} for event in mint_decisions)
+
+
+def test_mint_no_long_horizon_and_full_rank_different_targets_on_greedy_trap(tmp_path):
+    dag = get_workload("greedy_trap")
+    common_exp = {"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True, "timing_jitter_ms": 800}
+
+    no_long_config = _config(tmp_path, "mint_markov_no_long_horizon")
+    no_long_config["experiment"].update(common_exp)
+    no_long_config["planner"] = {"type": "markov", "horizon": 6}
+    MintController(no_long_config, dag=dag, baseline="mint_markov_no_long_horizon", dry_run=True).run(1)
+
+    full_config = _config(tmp_path, "mint_markov_full")
+    full_config["experiment"].update(common_exp)
+    full_config["planner"] = {"type": "markov", "horizon": 6}
+    MintController(full_config, dag=dag, baseline="mint_markov_full", dry_run=True).run(1)
+
+    no_long_events = _events(tmp_path / "mint_markov_no_long_horizon" / "events.jsonl")
+    full_events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    no_long_warmups = [event["logical_name"] for event in no_long_events if event.get("event_type") == "warmup"]
+    full_warmups = [event["logical_name"] for event in full_events if event.get("event_type") == "warmup"]
+    assert no_long_warmups != full_warmups
+    assert "f1" in no_long_warmups
+    assert any(node in {"f5", "f6", "f7", "f8"} for node in full_warmups)

@@ -30,6 +30,7 @@ SUPPORTED_BASELINES = {
     "mint_offline_unlimited",
     "mint_full",
     "mint_markov_offline",
+    "mint_markov_no_long_horizon",
     "mint_markov_full",
 }
 
@@ -141,17 +142,22 @@ class MintController:
             "orion_like",
             "mint_offline",
             "mint_offline_unlimited",
-            "mint_markov_offline",
         }:
             actions = self._static_baseline_actions(intents, workflow_index)
+        elif self.baseline == "mint_markov_offline":
+            actions = self._markov_offline_actions(intents)
         else:
             call_probability = self._profile_call_probability()
+            if self.baseline == "mint_markov_no_long_horizon":
+                path_benefit = self._runtime_local_benefit(intents, call_probability)
+            else:
+                path_benefit = self._runtime_path_benefit(intents)
             runtime_state = {
                 "now_sec": 0.0,
                 "call_probability": call_probability,
                 "frontier": self._observable_frontier(),
-                "hot_until": self._hot_until,
-                "path_benefit": self._runtime_path_benefit(intents),
+                "hot_until": dict(self._hot_until),
+                "path_benefit": path_benefit,
             }
             actions = schedule_intents(
                 intents,
@@ -199,7 +205,7 @@ class MintController:
         return count
 
     def _planner_type_for_baseline(self) -> str:
-        if self.baseline in {"mint_markov_offline", "mint_markov_full"}:
+        if self.baseline in {"mint_markov_offline", "mint_markov_no_long_horizon", "mint_markov_full"}:
             return "markov"
         if self.baseline in {"mint_offline", "mint_full"}:
             return "heuristic"
@@ -219,7 +225,7 @@ class MintController:
         return planner_config
 
     def _intent_planner_type(self) -> str:
-        if self.baseline in {"mint_markov_offline", "mint_markov_full"}:
+        if self.baseline in {"mint_markov_offline", "mint_markov_no_long_horizon", "mint_markov_full"}:
             return "markov"
         if self.baseline in {"mint_offline", "mint_full"}:
             return "heuristic"
@@ -282,6 +288,18 @@ class MintController:
                 + 0.5 * offline_score
             )
             benefits[node] = round(structural_value * reachability_score * cold_scale, 4)
+        return benefits
+
+    def _runtime_local_benefit(self, intents: list[WarmupIntent], call_probability: dict[str, float] | None = None) -> dict[str, float]:
+        call_probability = call_probability or self._profile_call_probability()
+        max_offline_gain = max((max(0.0, intent.offline_gain) for intent in intents), default=1.0) or 1.0
+        cold_ms = float(self.config.get("platform", {}).get("default_cold_start_ms", 800))
+        cold_scale = max(cold_ms / 800.0, 0.1)
+        benefits: dict[str, float] = {}
+        for intent in intents:
+            local_gain = max(0.0, intent.offline_gain) / max_offline_gain
+            reachability = min(max(float(call_probability.get(intent.logical_name, 1.0)), 0.0), 1.0)
+            benefits[intent.logical_name] = round(max(local_gain, 0.05) * max(reachability, 0.05) * cold_scale, 4)
         return benefits
 
     def _has_convergence_ancestor(self, node: str, convergence_nodes: set[str]) -> bool:
@@ -351,6 +369,17 @@ class MintController:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, "oracle_path_upper_bound"))
             else:
                 actions.append(WarmupAction("replace", intent, intent.offline_gain, "oracle_budget_exceeded"))
+        return actions
+
+    def _markov_offline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
+        budget = self._warmup_budget()
+        actions: list[WarmupAction] = []
+        for index, intent in enumerate(ranked):
+            if index < budget:
+                actions.append(WarmupAction("execute", intent, intent.offline_gain, "mint_markov_offline_top_intent_within_budget"))
+            else:
+                actions.append(WarmupAction("replace", intent, intent.offline_gain, "mint_markov_offline_budget_exceeded"))
         return actions
 
     def _static_baseline_actions(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupAction]:
