@@ -96,10 +96,13 @@ class MintController:
                 dry_run=self.dry_run,
                 region_name=self.config.get("aws", {}).get("region"),
             )
-            latency_ms = self._simulated_latency_ms(was_warm)
-            latency_ms += self._timing_jitter_ms(index, stages.get(logical, 0))
+            latency_ms, cold = self._observed_invocation_metrics(
+                response=response,
+                was_warm=was_warm,
+                workflow_index=index,
+                stage=stages.get(logical, 0),
+            )
             total_invocation_latency_ms += latency_ms
-            cold = not was_warm
             cold_count += int(cold)
             self._hot_until[logical] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
             event = InvocationEvent(
@@ -494,6 +497,33 @@ class MintController:
         base = float(platform.get("default_warm_duration_ms", 100))
         cold = 0.0 if warm else float(platform.get("default_cold_start_ms", 800))
         return round(base + cold + random.uniform(0, 15), 3)
+
+    def _observed_invocation_metrics(self, response: dict[str, Any], was_warm: bool, workflow_index: int, stage: int) -> tuple[float, bool]:
+        if self.dry_run:
+            latency_ms = self._simulated_latency_ms(was_warm)
+            latency_ms += self._timing_jitter_ms(workflow_index, stage)
+            return round(latency_ms, 3), not was_warm
+
+        payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
+        cold_start = bool(payload.get("cold_start", not was_warm))
+        latency_ms = self._coerce_observed_latency(response.get("client_elapsed_ms"))
+        if latency_ms is None:
+            latency_ms = self._coerce_observed_latency(payload.get("duration_ms"))
+        if latency_ms is None:
+            latency_ms = self._simulated_latency_ms(was_warm)
+        return round(latency_ms, 3), cold_start
+
+    @staticmethod
+    def _coerce_observed_latency(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            latency_ms = float(value)
+        except (TypeError, ValueError):
+            return None
+        if latency_ms < 0:
+            return None
+        return latency_ms
 
     def _write_runs_csv(self, summaries: list[dict[str, Any]]) -> None:
         ensure_dir(self.runs_path.parent)

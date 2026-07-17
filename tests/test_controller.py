@@ -325,3 +325,37 @@ def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp
     assert warmups["mint_markov_no_long_horizon"] != warmups["mint_markov_full"]
     assert "replace" not in actions["mint_markov_no_runtime_reval"]
     assert "replace" in actions["mint_markov_full"]
+
+
+def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
+    observed = {
+        "f1": {"cold_start": False, "client_elapsed_ms": 11.5, "duration_ms": 3.0},
+        "f2": {"cold_start": True, "client_elapsed_ms": 22.5, "duration_ms": 4.0},
+        "f3": {"cold_start": False, "client_elapsed_ms": 33.5, "duration_ms": 5.0},
+    }
+
+    def fake_invoke_lambda(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        logical = payload["function_name"]
+        metrics = observed[logical]
+        return {
+            "dry_run": False,
+            "function_name": function_name,
+            "status_code": 200,
+            "client_elapsed_ms": metrics["client_elapsed_ms"],
+            "payload": {"cold_start": metrics["cold_start"], "duration_ms": metrics["duration_ms"]},
+        }
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", fake_invoke_lambda)
+    config = _config(tmp_path, "no_warmup")
+    config["experiment"]["timing_jitter_ms"] = 800
+    config["platform"]["default_cold_start_ms"] = 900
+    controller = MintController(config, dag=get_workload("chain"), baseline="no_warmup", dry_run=False)
+    summary = controller.run(1)
+
+    events = _events(tmp_path / "no_warmup" / "events.jsonl")
+    invocations = [event for event in events if event.get("event_type") == "invocation"]
+    assert [event["logical_name"] for event in invocations] == ["f1", "f2", "f3"]
+    assert [event["cold_start"] for event in invocations] == [False, True, False]
+    assert [event["latency_ms"] for event in invocations] == [11.5, 22.5, 33.5]
+    assert summary["cold_start_count"] == 1
+    assert summary["invocation_latency_ms_avg"] == 22.5

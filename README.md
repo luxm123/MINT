@@ -61,6 +61,8 @@ Safety rule: do not store AWS access keys, secret keys, session tokens, or local
 
 Real AWS experiments may produce Lambda request, duration, logging, and related cloud charges. Matrix scripts default to dry-run behavior and require `--confirm-real-run` before they will issue real AWS calls.
 
+For real AWS runs, invocation events record the controller-observed Lambda invoke elapsed time and the Lambda handler's reported `cold_start` flag. Dry-run experiments continue to use the local simulated latency and hot-state model.
+
 ## Experiment Matrix
 
 Use `scripts/run_experiment_matrix.py` to evaluate multiple DAGs, baselines, and warmup budgets with independent output directories and a shared summary table.

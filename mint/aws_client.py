@@ -46,6 +46,7 @@ def invoke_lambda(
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
+            invoke_start = time.perf_counter()
             response = client.invoke(FunctionName=function_name, InvocationType=invocation_type, Payload=body)
             parsed: dict[str, Any] = {
                 "dry_run": False,
@@ -56,6 +57,7 @@ def invoke_lambda(
                 raw = response["Payload"].read()
                 if raw:
                     parsed["payload"] = json.loads(raw.decode("utf-8"))
+            parsed["client_elapsed_ms"] = round((time.perf_counter() - invoke_start) * 1000.0, 3)
             return parsed
         except (BotoCoreError, ClientError, TimeoutError) as exc:
             last_error = exc
