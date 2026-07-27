@@ -86,6 +86,14 @@ class MintController:
             json.dump(summary, fh, indent=2, sort_keys=True)
         return summary
 
+    def reset_runtime_state(self) -> None:
+        """Forget controller-inferred heat after an external function-pool reset."""
+        self._hot_until.clear()
+        self._warmups.clear()
+
+    def observed_environment_ids(self) -> dict[str, str]:
+        return dict(self._last_environment_ids)
+
     def run_once(
         self,
         index: int,
