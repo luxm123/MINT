@@ -22,9 +22,14 @@ class InvocationEvent(EventBase):
     logical_name: str = ""
     invocation_type: str = "real"
     cold_start: bool = False
+    request_id: str = ""
+    execution_environment_id: str = ""
     latency_ms: float = 0.0
+    function_duration_ms: float = 0.0
     stage: int = 0
     status: str = "ok"
+    error_type: str = ""
+    error_message: str = ""
 
 
 @dataclass
@@ -36,6 +41,15 @@ class WarmupEvent(EventBase):
     useful: bool = False
     action_reason: str = ""
     gain: float = 0.0
+    invocation_type: str = "warmup"
+    cold_start: bool = False
+    request_id: str = ""
+    execution_environment_id: str = ""
+    latency_ms: float = 0.0
+    function_duration_ms: float = 0.0
+    status: str = "ok"
+    error_type: str = ""
+    error_message: str = ""
 
 
 @dataclass
@@ -58,3 +72,5 @@ class WorkflowRunSummary(EventBase):
     cold_start_count: int = 0
     warmup_count: int = 0
     status: str = "ok"
+    start_time: str = ""
+    end_time: str = ""

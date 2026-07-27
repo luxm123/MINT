@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 IS_COLD_START = True
+EXECUTION_ENV_ID = str(uuid.uuid4())
 
 
 def _now() -> str:
@@ -33,9 +35,14 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "run_id": event.get("run_id", ""),
         "invocation_type": invocation_type,
         "cold_start": cold_start,
+        "execution_environment_id": EXECUTION_ENV_ID,
+        "request_id": getattr(context, "aws_request_id", ""),
         "start_time": start_time,
         "end_time": end_time,
         "duration_ms": duration_ms,
+        "status": "ok",
+        "error_type": "",
+        "error_message": "",
     }
     return json.loads(json.dumps(result))
 

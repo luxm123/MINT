@@ -52,6 +52,9 @@ def invoke_lambda(
                 "dry_run": False,
                 "function_name": function_name,
                 "status_code": response.get("StatusCode"),
+                "function_error": response.get("FunctionError", ""),
+                "response_metadata_request_id": response.get("ResponseMetadata", {}).get("RequestId", ""),
+                "invocation_type": invocation_type,
             }
             if "Payload" in response:
                 raw = response["Payload"].read()

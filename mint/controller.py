@@ -12,7 +12,7 @@ from mint.events import InvocationEvent, SchedulerDecision, WarmupEvent, Workflo
 from mint.intent_planner import WarmupIntent, plan_intents
 from mint.metrics import compute_summary
 from mint.scheduler import WarmupAction, schedule_intents
-from mint.utils import append_jsonl, ensure_dir, monotonic_sec, new_id
+from mint.utils import append_jsonl, ensure_dir, monotonic_sec, new_id, utc_now_iso
 from mint.workloads import WorkflowDAG, get_workload
 
 
@@ -34,6 +34,9 @@ SUPPORTED_BASELINES = {
     "mint_markov_no_long_horizon",
     "mint_markov_full",
 }
+
+class InvalidRealObservation(RuntimeError):
+    pass
 
 
 class MintController:
@@ -75,14 +78,14 @@ class MintController:
         planner_config = self._planner_config()
         intents = plan_intents(self.dag, planner_config)
         selected_nodes = self._resolve_path(context)
-        start = monotonic_sec()
         cold_count = 0
         warmup_count = 0
-        total_invocation_latency_ms = 0.0
 
         if self.baseline != "no_warmup":
-            warmup_count += self._run_warmups(run_id, intents, selected_nodes, start, index)
+            warmup_count += self._run_warmups(run_id, intents, selected_nodes, monotonic_sec(), index)
 
+        workflow_start = monotonic_sec()
+        workflow_start_time = utc_now_iso()
         stages = self.dag.stages()
         aws_map = self.config.get("aws", {}).get("lambda_functions", {})
         for logical in selected_nodes:
@@ -90,19 +93,44 @@ class MintController:
             now = monotonic_sec()
             was_warm = self._hot_until.get(logical, 0.0) > now
             payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
-            response = invoke_lambda(
-                function_name=function_name,
-                payload=payload,
-                dry_run=self.dry_run,
-                region_name=self.config.get("aws", {}).get("region"),
-            )
-            latency_ms, cold = self._observed_invocation_metrics(
-                response=response,
-                was_warm=was_warm,
-                workflow_index=index,
-                stage=stages.get(logical, 0),
-            )
-            total_invocation_latency_ms += latency_ms
+            response: dict[str, Any] = {}
+            try:
+                response = invoke_lambda(
+                    function_name=function_name,
+                    payload=payload,
+                    dry_run=self.dry_run,
+                    region_name=self.config.get("aws", {}).get("region"),
+                )
+                observed = self._observed_invocation_metrics(
+                    response=response,
+                    was_warm=was_warm,
+                    workflow_index=index,
+                    stage=stages.get(logical, 0),
+                )
+            except Exception as exc:
+                observed = self._failed_observation(response, exc)
+                append_jsonl(
+                    self.events_path,
+                    InvocationEvent(
+                        event_type="invocation",
+                        run_id=run_id,
+                        function_name=function_name,
+                        logical_name=logical,
+                        invocation_type="real",
+                        cold_start=observed["cold_start"],
+                        request_id=observed["request_id"],
+                        execution_environment_id=observed["execution_environment_id"],
+                        latency_ms=observed["latency_ms"],
+                        function_duration_ms=observed["function_duration_ms"],
+                        stage=stages.get(logical, 0),
+                        status="error",
+                        error_type=observed["error_type"],
+                        error_message=observed["error_message"],
+                    ).to_dict(),
+                )
+                raise
+            latency_ms = observed["latency_ms"]
+            cold = observed["cold_start"]
             cold_count += int(cold)
             self._hot_until[logical] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
             event = InvocationEvent(
@@ -112,13 +140,19 @@ class MintController:
                 logical_name=logical,
                 invocation_type="real",
                 cold_start=cold,
+                request_id=observed["request_id"],
+                execution_environment_id=observed["execution_environment_id"],
                 latency_ms=latency_ms,
+                function_duration_ms=observed["function_duration_ms"],
                 stage=stages.get(logical, 0),
-                status="ok" if response.get("status_code", 200) < 400 else "error",
+                status=observed["status"],
+                error_type=observed["error_type"],
+                error_message=observed["error_message"],
             )
             append_jsonl(self.events_path, event.to_dict())
 
-        latency_ms = round(max((monotonic_sec() - start) * 1000.0, total_invocation_latency_ms), 3)
+        latency_ms = round((monotonic_sec() - workflow_start) * 1000.0, 3)
+        workflow_end_time = utc_now_iso()
         summary_event = WorkflowRunSummary(
             event_type="workflow_summary",
             run_id=run_id,
@@ -128,6 +162,8 @@ class MintController:
             latency_ms=latency_ms,
             cold_start_count=cold_count,
             warmup_count=warmup_count,
+            start_time=workflow_start_time,
+            end_time=workflow_end_time,
         )
         append_jsonl(self.events_path, summary_event.to_dict())
         return summary_event.to_dict()
@@ -190,7 +226,47 @@ class MintController:
             if action.action_type != "execute":
                 continue
             payload = {"function_name": intent.logical_name, "run_id": run_id, "invocation_type": "warmup", "sleep_ms": 1}
-            invoke_lambda(intent.function_name, payload, invocation_type="Event", dry_run=self.dry_run, region_name=self.config.get("aws", {}).get("region"))
+            response: dict[str, Any] = {}
+            try:
+                response = invoke_lambda(
+                    intent.function_name,
+                    payload,
+                    invocation_type="RequestResponse",
+                    dry_run=self.dry_run,
+                    region_name=self.config.get("aws", {}).get("region"),
+                )
+                observed = self._observed_invocation_metrics(
+                    response=response,
+                    was_warm=self._hot_until.get(intent.logical_name, 0.0) > monotonic_sec(),
+                    workflow_index=workflow_index,
+                    stage=intent.stage,
+                )
+            except Exception as exc:
+                observed = self._failed_observation(response, exc)
+                append_jsonl(
+                    self.events_path,
+                    WarmupEvent(
+                        event_type="warmup",
+                        run_id=run_id,
+                        function_name=intent.function_name,
+                        logical_name=intent.logical_name,
+                        intent_id=intent.intent_id,
+                        action=action.action_type,
+                        useful=False,
+                        action_reason=action.action_reason,
+                        gain=action.gain,
+                        invocation_type="warmup",
+                        cold_start=observed["cold_start"],
+                        request_id=observed["request_id"],
+                        execution_environment_id=observed["execution_environment_id"],
+                        latency_ms=observed["latency_ms"],
+                        function_duration_ms=observed["function_duration_ms"],
+                        status="error",
+                        error_type=observed["error_type"],
+                        error_message=observed["error_message"],
+                    ).to_dict(),
+                )
+                raise
             useful = intent.logical_name in selected_nodes
             if useful:
                 self._warmups.add(f"{run_id}:{intent.logical_name}")
@@ -205,6 +281,15 @@ class MintController:
                 useful=useful,
                 action_reason=action.action_reason,
                 gain=action.gain,
+                invocation_type="warmup",
+                cold_start=observed["cold_start"],
+                request_id=observed["request_id"],
+                execution_environment_id=observed["execution_environment_id"],
+                latency_ms=observed["latency_ms"],
+                function_duration_ms=observed["function_duration_ms"],
+                status=observed["status"],
+                error_type=observed["error_type"],
+                error_message=observed["error_message"],
             )
             append_jsonl(self.events_path, warmup_event.to_dict())
             count += 1
@@ -498,20 +583,69 @@ class MintController:
         cold = 0.0 if warm else float(platform.get("default_cold_start_ms", 800))
         return round(base + cold + random.uniform(0, 15), 3)
 
-    def _observed_invocation_metrics(self, response: dict[str, Any], was_warm: bool, workflow_index: int, stage: int) -> tuple[float, bool]:
+    def _observed_invocation_metrics(self, response: dict[str, Any], was_warm: bool, workflow_index: int, stage: int) -> dict[str, Any]:
         if self.dry_run:
             latency_ms = self._simulated_latency_ms(was_warm)
             latency_ms += self._timing_jitter_ms(workflow_index, stage)
-            return round(latency_ms, 3), not was_warm
+            return {
+                "latency_ms": round(latency_ms, 3),
+                "function_duration_ms": round(latency_ms, 3),
+                "cold_start": not was_warm,
+                "request_id": "",
+                "execution_environment_id": "",
+                "status": "ok",
+                "error_type": "",
+                "error_message": "",
+            }
 
         payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
-        cold_start = bool(payload.get("cold_start", not was_warm))
+        required = ("cold_start", "execution_environment_id", "request_id", "duration_ms", "invocation_type", "status")
+        missing = [key for key in required if key not in payload]
+        if missing:
+            raise InvalidRealObservation(f"real Lambda response missing required fields: {', '.join(missing)}")
+        empty = [key for key in ("execution_environment_id", "request_id") if not str(payload.get(key) or "").strip()]
+        if empty:
+            raise InvalidRealObservation(f"real Lambda response has empty required fields: {', '.join(empty)}")
+        if payload["invocation_type"] not in {"real", "warmup"}:
+            raise InvalidRealObservation(f"invalid invocation_type in real Lambda response: {payload['invocation_type']!r}")
+        status_code = response.get("status_code")
+        function_error = str(response.get("function_error") or "")
+        payload_status = str(payload.get("status") or "")
+        status = "ok" if isinstance(status_code, int) and status_code < 400 and not function_error and payload_status == "ok" else "error"
+        if status != "ok":
+            raise InvalidRealObservation(
+                f"real Lambda invocation failed: status_code={status_code}, function_error={function_error!r}, "
+                f"payload_status={payload_status!r}, error={payload.get('error_message', '')!r}"
+            )
         latency_ms = self._coerce_observed_latency(response.get("client_elapsed_ms"))
         if latency_ms is None:
-            latency_ms = self._coerce_observed_latency(payload.get("duration_ms"))
-        if latency_ms is None:
-            latency_ms = self._simulated_latency_ms(was_warm)
-        return round(latency_ms, 3), cold_start
+            raise InvalidRealObservation("real Lambda response missing valid client_elapsed_ms; simulated fallback is forbidden")
+        function_duration_ms = self._coerce_observed_latency(payload.get("duration_ms"))
+        if function_duration_ms is None:
+            raise InvalidRealObservation("real Lambda response missing valid duration_ms")
+        return {
+            "latency_ms": round(latency_ms, 3),
+            "function_duration_ms": round(function_duration_ms, 3),
+            "cold_start": bool(payload["cold_start"]),
+            "request_id": str(payload["request_id"]),
+            "execution_environment_id": str(payload["execution_environment_id"]),
+            "status": status,
+            "error_type": str(payload.get("error_type") or function_error),
+            "error_message": str(payload.get("error_message") or ""),
+        }
+
+    def _failed_observation(self, response: dict[str, Any], exc: Exception) -> dict[str, Any]:
+        payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
+        return {
+            "latency_ms": self._coerce_observed_latency(response.get("client_elapsed_ms")) or 0.0,
+            "function_duration_ms": self._coerce_observed_latency(payload.get("duration_ms")) or 0.0,
+            "cold_start": bool(payload.get("cold_start", False)),
+            "request_id": str(payload.get("request_id") or response.get("response_metadata_request_id") or ""),
+            "execution_environment_id": str(payload.get("execution_environment_id") or ""),
+            "status": "error",
+            "error_type": type(exc).__name__,
+            "error_message": str(exc),
+        }
 
     @staticmethod
     def _coerce_observed_latency(value: Any) -> float | None:

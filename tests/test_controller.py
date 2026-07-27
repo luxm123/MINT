@@ -1,7 +1,8 @@
 import mint.controller as controller_mod
-from mint.controller import MintController
+from mint.controller import InvalidRealObservation, MintController
 from mint.workloads import get_workload
 import json
+import pytest
 
 
 def _config(tmp_path, baseline):
@@ -329,9 +330,9 @@ def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp
 
 def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
     observed = {
-        "f1": {"cold_start": False, "client_elapsed_ms": 11.5, "duration_ms": 3.0},
-        "f2": {"cold_start": True, "client_elapsed_ms": 22.5, "duration_ms": 4.0},
-        "f3": {"cold_start": False, "client_elapsed_ms": 33.5, "duration_ms": 5.0},
+        "f1": {"cold_start": False, "client_elapsed_ms": 11.5, "duration_ms": 3.0, "request_id": "req-1", "execution_environment_id": "env-a"},
+        "f2": {"cold_start": True, "client_elapsed_ms": 22.5, "duration_ms": 4.0, "request_id": "req-2", "execution_environment_id": "env-b"},
+        "f3": {"cold_start": False, "client_elapsed_ms": 33.5, "duration_ms": 5.0, "request_id": "req-3", "execution_environment_id": "env-a"},
     }
 
     def fake_invoke_lambda(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
@@ -342,7 +343,14 @@ def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
             "function_name": function_name,
             "status_code": 200,
             "client_elapsed_ms": metrics["client_elapsed_ms"],
-            "payload": {"cold_start": metrics["cold_start"], "duration_ms": metrics["duration_ms"]},
+            "payload": {
+                "cold_start": metrics["cold_start"],
+                "duration_ms": metrics["duration_ms"],
+                "request_id": metrics["request_id"],
+                "execution_environment_id": metrics["execution_environment_id"],
+                "invocation_type": payload["invocation_type"],
+                "status": "ok",
+            },
         }
 
     monkeypatch.setattr(controller_mod, "invoke_lambda", fake_invoke_lambda)
@@ -357,5 +365,36 @@ def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
     assert [event["logical_name"] for event in invocations] == ["f1", "f2", "f3"]
     assert [event["cold_start"] for event in invocations] == [False, True, False]
     assert [event["latency_ms"] for event in invocations] == [11.5, 22.5, 33.5]
+    assert [event["request_id"] for event in invocations] == ["req-1", "req-2", "req-3"]
+    assert [event["execution_environment_id"] for event in invocations] == ["env-a", "env-b", "env-a"]
+    assert [event["function_duration_ms"] for event in invocations] == [3.0, 4.0, 5.0]
     assert summary["cold_start_count"] == 1
     assert summary["invocation_latency_ms_avg"] == 22.5
+
+
+def test_real_aws_run_forbids_simulated_metric_fallback(tmp_path, monkeypatch):
+    def fake_invoke_lambda(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        return {
+            "dry_run": False,
+            "function_name": function_name,
+            "status_code": 200,
+            "payload": {
+                "cold_start": True,
+                "duration_ms": 4.0,
+                "request_id": "req-1",
+                "execution_environment_id": "env-a",
+                "invocation_type": payload["invocation_type"],
+                "status": "ok",
+            },
+        }
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", fake_invoke_lambda)
+    monkeypatch.setattr(
+        MintController,
+        "_simulated_latency_ms",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("real mode must never simulate")),
+    )
+    controller = MintController(_config(tmp_path, "no_warmup"), dag=get_workload("chain"), baseline="no_warmup", dry_run=False)
+
+    with pytest.raises(InvalidRealObservation, match="client_elapsed_ms"):
+        controller.run(1)

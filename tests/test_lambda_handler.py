@@ -8,3 +8,6 @@ def test_lambda_handler_entrypoint_and_type_alias():
     assert result["run_id"] == "r1"
     assert result["invocation_type"] == "warmup"
     assert result["cold_start"] is True
+    assert result["execution_environment_id"]
+    assert result["request_id"] == ""
+    assert result["status"] == "ok"
