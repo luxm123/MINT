@@ -398,3 +398,64 @@ def test_real_aws_run_forbids_simulated_metric_fallback(tmp_path, monkeypatch):
 
     with pytest.raises(InvalidRealObservation, match="client_elapsed_ms"):
         controller.run(1)
+
+
+def test_controller_uses_selected_function_pool_for_real_and_warmup_calls(tmp_path, monkeypatch):
+    called = []
+
+    def fake_invoke_lambda(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        called.append((function_name, payload["invocation_type"]))
+        return {
+            "dry_run": False,
+            "function_name": function_name,
+            "status_code": 200,
+            "client_elapsed_ms": 5.0,
+            "payload": {
+                "cold_start": False,
+                "duration_ms": 1.0,
+                "request_id": f"req-{len(called)}",
+                "execution_environment_id": f"env-{function_name}",
+                "invocation_type": payload["invocation_type"],
+                "status": "ok",
+            },
+        }
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", fake_invoke_lambda)
+    config = _config(tmp_path, "mint_markov_full")
+    config["experiment"].update({"function_pool": "pool_b", "warmup_lead_sec": 0})
+    config["aws"]["lambda_function_pools"] = {
+        "pool_b": {f"f{i}": f"pool-b-f{i}" for i in range(1, 9)}
+    }
+    controller = MintController(config, dag=get_workload("wide_branch"), baseline="mint_markov_full", dry_run=False)
+    controller.run_once(0, planned_arrival_sec=controller_mod.monotonic_sec())
+
+    assert called
+    assert all(name.startswith("pool-b-") for name, _ in called)
+    assert any(kind == "warmup" for _, kind in called)
+    assert any(kind == "real" for _, kind in called)
+
+
+def test_warmup_overrun_is_counted_in_end_to_end_latency(tmp_path, monkeypatch):
+    def slow_dry_invoke(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        import time
+
+        time.sleep(0.02)
+        return {"dry_run": True, "function_name": function_name, "payload": payload, "status_code": 200}
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", slow_dry_invoke)
+    config = _config(tmp_path, "mint_markov_full")
+    config["experiment"]["warmup_lead_sec"] = 0
+    controller = MintController(config, dag=get_workload("chain"), baseline="mint_markov_full", dry_run=True)
+    planned = controller_mod.monotonic_sec()
+    result = controller.run_once(
+        0,
+        block_id="block-0000",
+        strategy_order="mint_markov_full,no_warmup",
+        planned_arrival_sec=planned,
+        planned_arrival_time="2026-01-01T00:00:00+00:00",
+    )
+
+    assert result["arrival_lateness_ms"] >= 35
+    assert result["warmup_overrun_ms"] == result["arrival_lateness_ms"]
+    assert result["latency_ms"] >= result["arrival_lateness_ms"]
+    assert result["block_id"] == "block-0000"

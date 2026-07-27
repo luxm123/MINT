@@ -74,3 +74,12 @@ class WorkflowRunSummary(EventBase):
     status: str = "ok"
     start_time: str = ""
     end_time: str = ""
+    block_id: str = ""
+    function_pool: str = ""
+    branch_seed: int = 0
+    strategy_order: str = ""
+    planned_arrival_time: str = ""
+    actual_start_time: str = ""
+    arrival_lateness_ms: float = 0.0
+    warmup_overrun_ms: float = 0.0
+    initial_environment_ids: str = "{}"

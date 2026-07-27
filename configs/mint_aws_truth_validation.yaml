@@ -9,6 +9,25 @@ aws:
     f6: mint-f6
     f7: mint-f7
     f8: mint-f8
+  lambda_function_pools:
+    no_warmup_pool:
+      f1: mint-nowarm-f1
+      f2: mint-nowarm-f2
+      f3: mint-nowarm-f3
+      f4: mint-nowarm-f4
+      f5: mint-nowarm-f5
+      f6: mint-nowarm-f6
+      f7: mint-nowarm-f7
+      f8: mint-nowarm-f8
+    mint_full_pool:
+      f1: mint-full-f1
+      f2: mint-full-f2
+      f3: mint-full-f3
+      f4: mint-full-f4
+      f5: mint-full-f5
+      f6: mint-full-f6
+      f7: mint-full-f7
+      f8: mint-full-f8
 
 experiment:
   dag: wide_branch

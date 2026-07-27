@@ -4,6 +4,7 @@ import csv
 import copy
 import json
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,35 +62,67 @@ class MintController:
         self.summary_path = self.output_dir / "summary.json"
         self._hot_until: dict[str, float] = {}
         self._warmups: set[str] = set()
+        self._last_environment_ids: dict[str, str] = {}
         self.planner_type = self._planner_type_for_baseline()
         self._workflow_index = 0
+        self.function_pool = str(exp_cfg.get("function_pool", self.baseline))
+        pools = config.get("aws", {}).get("lambda_function_pools", {})
+        configured_pool = exp_cfg.get("function_pool")
+        if configured_pool and configured_pool not in pools:
+            raise ValueError(f"Unknown Lambda function pool: {configured_pool}")
+        self.function_map = dict(pools.get(self.function_pool, config.get("aws", {}).get("lambda_functions", {})))
+        missing_nodes = [node for node in self.dag.nodes if node not in self.function_map]
+        if not self.dry_run and missing_nodes:
+            raise ValueError(f"Lambda function pool {self.function_pool!r} is missing DAG nodes: {', '.join(missing_nodes)}")
 
     def run(self, repetitions: int) -> dict[str, Any]:
         summaries = [self.run_once(index) for index in range(repetitions)]
+        return self.finalize(summaries)
+
+    def finalize(self, summaries: list[dict[str, Any]]) -> dict[str, Any]:
         self._write_runs_csv(summaries)
         summary = compute_summary(self.events_path)
         with self.summary_path.open("w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2, sort_keys=True)
         return summary
 
-    def run_once(self, index: int) -> dict[str, Any]:
+    def run_once(
+        self,
+        index: int,
+        *,
+        block_id: str = "",
+        strategy_order: str = "",
+        planned_arrival_sec: float | None = None,
+        planned_arrival_time: str = "",
+    ) -> dict[str, Any]:
         run_id = new_id("run")
         context = self._run_context(index)
         planner_config = self._planner_config()
         intents = plan_intents(self.dag, planner_config)
         selected_nodes = self._resolve_path(context)
+        initial_environment_ids = json.dumps(self._last_environment_ids, sort_keys=True)
         cold_count = 0
         warmup_count = 0
+        planned_arrival_sec = monotonic_sec() if planned_arrival_sec is None else planned_arrival_sec
+        warmup_lead_sec = max(0.0, float(self.config.get("experiment", {}).get("warmup_lead_sec", 0.0)))
+        warmup_start_sec = planned_arrival_sec - warmup_lead_sec
+        wait_for_warmup_sec = warmup_start_sec - monotonic_sec()
+        if wait_for_warmup_sec > 0:
+            time.sleep(wait_for_warmup_sec)
 
         if self.baseline != "no_warmup":
             warmup_count += self._run_warmups(run_id, intents, selected_nodes, monotonic_sec(), index)
 
+        wait_for_arrival_sec = planned_arrival_sec - monotonic_sec()
+        if wait_for_arrival_sec > 0:
+            time.sleep(wait_for_arrival_sec)
         workflow_start = monotonic_sec()
         workflow_start_time = utc_now_iso()
+        arrival_lateness_ms = round(max(0.0, workflow_start - planned_arrival_sec) * 1000.0, 3)
+        warmup_overrun_ms = arrival_lateness_ms if self.baseline != "no_warmup" else 0.0
         stages = self.dag.stages()
-        aws_map = self.config.get("aws", {}).get("lambda_functions", {})
         for logical in selected_nodes:
-            function_name = aws_map.get(logical, logical)
+            function_name = self.function_map.get(logical, logical)
             now = monotonic_sec()
             was_warm = self._hot_until.get(logical, 0.0) > now
             payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
@@ -132,6 +165,7 @@ class MintController:
             latency_ms = observed["latency_ms"]
             cold = observed["cold_start"]
             cold_count += int(cold)
+            self._last_environment_ids[logical] = observed["execution_environment_id"]
             self._hot_until[logical] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
             event = InvocationEvent(
                 event_type="invocation",
@@ -151,7 +185,7 @@ class MintController:
             )
             append_jsonl(self.events_path, event.to_dict())
 
-        latency_ms = round((monotonic_sec() - workflow_start) * 1000.0, 3)
+        latency_ms = round((monotonic_sec() - planned_arrival_sec) * 1000.0, 3)
         workflow_end_time = utc_now_iso()
         summary_event = WorkflowRunSummary(
             event_type="workflow_summary",
@@ -164,6 +198,15 @@ class MintController:
             warmup_count=warmup_count,
             start_time=workflow_start_time,
             end_time=workflow_end_time,
+            block_id=block_id,
+            function_pool=self.function_pool,
+            branch_seed=int(self.config.get("experiment", {}).get("branch_seed", 0)),
+            strategy_order=strategy_order,
+            planned_arrival_time=planned_arrival_time,
+            actual_start_time=workflow_start_time,
+            arrival_lateness_ms=arrival_lateness_ms,
+            warmup_overrun_ms=warmup_overrun_ms,
+            initial_environment_ids=initial_environment_ids,
         )
         append_jsonl(self.events_path, summary_event.to_dict())
         return summary_event.to_dict()
@@ -268,6 +311,7 @@ class MintController:
                 )
                 raise
             useful = intent.logical_name in selected_nodes
+            self._last_environment_ids[intent.logical_name] = observed["execution_environment_id"]
             if useful:
                 self._warmups.add(f"{run_id}:{intent.logical_name}")
             self._hot_until[intent.logical_name] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
@@ -313,6 +357,7 @@ class MintController:
     def _planner_config(self) -> dict[str, Any]:
         planner_config = copy.deepcopy(self.config)
         planner_config.setdefault("planner", {})["type"] = self._intent_planner_type()
+        planner_config.setdefault("aws", {})["lambda_functions"] = dict(self.function_map)
         return planner_config
 
     def _intent_planner_type(self) -> str:
@@ -662,7 +707,28 @@ class MintController:
     def _write_runs_csv(self, summaries: list[dict[str, Any]]) -> None:
         ensure_dir(self.runs_path.parent)
         with self.runs_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=["run_id", "dag", "baseline", "planner_type", "latency_ms", "cold_start_count", "warmup_count", "status"])
+            writer = csv.DictWriter(
+                fh,
+                fieldnames=[
+                    "run_id",
+                    "dag",
+                    "baseline",
+                    "planner_type",
+                    "latency_ms",
+                    "cold_start_count",
+                    "warmup_count",
+                    "status",
+                    "block_id",
+                    "function_pool",
+                    "branch_seed",
+                    "strategy_order",
+                    "planned_arrival_time",
+                    "actual_start_time",
+                    "arrival_lateness_ms",
+                    "warmup_overrun_ms",
+                    "initial_environment_ids",
+                ],
+            )
             writer.writeheader()
             for row in summaries:
                 writer.writerow({key: row.get(key) for key in writer.fieldnames})
