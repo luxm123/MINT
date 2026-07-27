@@ -456,6 +456,18 @@ def test_warmup_overrun_is_counted_in_end_to_end_latency(tmp_path, monkeypatch):
     )
 
     assert result["arrival_lateness_ms"] >= 35
-    assert result["warmup_overrun_ms"] == result["arrival_lateness_ms"]
+    assert 0 < result["warmup_overrun_ms"] <= result["arrival_lateness_ms"]
     assert result["latency_ms"] >= result["arrival_lateness_ms"]
     assert result["block_id"] == "block-0000"
+
+
+def test_no_executed_warmup_never_reports_warmup_overrun(tmp_path, monkeypatch):
+    monkeypatch.setattr(controller_mod, "schedule_intents", lambda *args, **kwargs: [])
+    config = _config(tmp_path, "mint_markov_full")
+    config["experiment"]["warmup_lead_sec"] = 0
+    controller = MintController(config, dag=get_workload("chain"), baseline="mint_markov_full", dry_run=True)
+
+    result = controller.run_once(0, planned_arrival_sec=controller_mod.monotonic_sec())
+
+    assert result["warmup_count"] == 0
+    assert result["warmup_overrun_ms"] == 0.0

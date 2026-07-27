@@ -112,6 +112,7 @@ class MintController:
 
         if self.baseline != "no_warmup":
             warmup_count += self._run_warmups(run_id, intents, selected_nodes, monotonic_sec(), index)
+        warmup_completed_sec = monotonic_sec()
 
         wait_for_arrival_sec = planned_arrival_sec - monotonic_sec()
         if wait_for_arrival_sec > 0:
@@ -119,7 +120,11 @@ class MintController:
         workflow_start = monotonic_sec()
         workflow_start_time = utc_now_iso()
         arrival_lateness_ms = round(max(0.0, workflow_start - planned_arrival_sec) * 1000.0, 3)
-        warmup_overrun_ms = arrival_lateness_ms if self.baseline != "no_warmup" else 0.0
+        warmup_overrun_ms = (
+            round(max(0.0, warmup_completed_sec - planned_arrival_sec) * 1000.0, 3)
+            if warmup_count > 0
+            else 0.0
+        )
         stages = self.dag.stages()
         for logical in selected_nodes:
             function_name = self.function_map.get(logical, logical)
