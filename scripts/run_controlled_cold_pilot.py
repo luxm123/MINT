@@ -58,12 +58,15 @@ def reset_function_pool(
     token: str,
     *,
     dry_run: bool,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     rows = []
+    qualified_map: dict[str, str] = {}
     for logical_name in dag_nodes:
         function_name = function_map[logical_name]
         started_at = datetime.now(timezone.utc).isoformat()
         if dry_run:
+            version = f"dry-{token[:8]}"
+            qualified_map[logical_name] = f"{function_name}:{version}"
             completed_at = datetime.now(timezone.utc).isoformat()
             rows.append(
                 {
@@ -73,6 +76,9 @@ def reset_function_pool(
                     "reset_started_at": started_at,
                     "reset_completed_at": completed_at,
                     "last_update_status": "DryRun",
+                    "published_version": version,
+                    "qualified_function_name": qualified_map[logical_name],
+                    "code_sha256": "",
                 }
             )
             continue
@@ -89,6 +95,16 @@ def reset_function_pool(
         status = str(updated.get("LastUpdateStatus") or "")
         if status != "Successful":
             raise RuntimeError(f"Lambda reset failed for {function_name}: LastUpdateStatus={status!r}")
+        published = lambda_client.publish_version(
+            FunctionName=function_name,
+            Description=f"MINT controlled cold reset {token}",
+        )
+        version = str(published["Version"])
+        lambda_client.get_waiter("function_active_v2").wait(
+            FunctionName=function_name,
+            Qualifier=version,
+        )
+        qualified_map[logical_name] = f"{function_name}:{version}"
         rows.append(
             {
                 "logical_name": logical_name,
@@ -97,9 +113,12 @@ def reset_function_pool(
                 "reset_started_at": started_at,
                 "reset_completed_at": datetime.now(timezone.utc).isoformat(),
                 "last_update_status": status,
+                "published_version": version,
+                "qualified_function_name": qualified_map[logical_name],
+                "code_sha256": str(published.get("CodeSha256") or ""),
             }
         )
-    return rows
+    return rows, qualified_map
 
 
 def validate_controlled_cold_run(
@@ -158,6 +177,7 @@ def main() -> int:
         lambda_client = boto3.client("lambda", region_name=base_config.get("aws", {}).get("region"))
 
     controllers: dict[str, MintController] = {}
+    base_function_maps: dict[str, dict[str, str]] = {}
     summaries: dict[str, list[dict[str, Any]]] = {baseline: [] for baseline in args.baselines}
     for baseline, pool in zip(args.baselines, args.pools):
         config = copy.deepcopy(base_config)
@@ -181,6 +201,7 @@ def main() -> int:
             dry_run=dry_run,
             output_dir=output_root / baseline,
         )
+        base_function_maps[baseline] = dict(controllers[baseline].function_map)
 
     reset_rows: list[dict[str, Any]] = []
     validation_rows: list[dict[str, Any]] = []
@@ -193,13 +214,14 @@ def main() -> int:
             previous_ids = controller.observed_environment_ids()
             token = f"{block_id}-{baseline}-{uuid.uuid4().hex}"
             controller.reset_runtime_state()
-            block_reset_rows = reset_function_pool(
+            block_reset_rows, qualified_map = reset_function_pool(
                 lambda_client,
-                controller.function_map,
+                base_function_maps[baseline],
                 dag.nodes,
                 token,
                 dry_run=dry_run,
             )
+            controller.function_map = qualified_map
             for row in block_reset_rows:
                 row.update(
                     {

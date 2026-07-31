@@ -37,6 +37,14 @@ def _read_invocations(path: Path) -> list[dict[str, Any]]:
 def _epoch_ms(value: str) -> int:
     return int(datetime.fromisoformat(value).timestamp() * 1000)
 
+def _log_group_name(function_name: str) -> str:
+    if function_name.startswith("arn:"):
+        resource = function_name.split(":function:", 1)[-1]
+        base_name = resource.split(":", 1)[0]
+    else:
+        base_name = function_name.split(":", 1)[0]
+    return f"/aws/lambda/{base_name}"
+
 
 def main() -> int:
     args = _args()
@@ -57,7 +65,7 @@ def main() -> int:
     for function_name, function_rows in by_function.items():
         timestamps = [_epoch_ms(str(row["timestamp"])) for row in function_rows]
         kwargs: dict[str, Any] = {
-            "logGroupName": f"/aws/lambda/{function_name}",
+            "logGroupName": _log_group_name(function_name),
             "startTime": min(timestamps) - 60_000,
             "endTime": max(timestamps) + 300_000,
         }

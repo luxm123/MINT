@@ -10,6 +10,7 @@ class FakeLambdaClient:
     def __init__(self):
         self.variables = {}
         self.updates = []
+        self.version = 0
 
     def get_function_configuration(self, FunctionName):
         return {
@@ -22,8 +23,12 @@ class FakeLambdaClient:
         self.updates.append(FunctionName)
 
     def get_waiter(self, name):
-        assert name == "function_updated_v2"
+        assert name in {"function_updated_v2", "function_active_v2"}
         return FakeWaiter()
+
+    def publish_version(self, FunctionName, Description):
+        self.version += 1
+        return {"Version": str(self.version), "CodeSha256": "same-code"}
 
 
 def _event(logical, invocation_type, cold, env):
@@ -40,7 +45,7 @@ def _event(logical, invocation_type, cold, env):
 def test_reset_function_pool_preserves_environment_and_adds_unique_token():
     client = FakeLambdaClient()
     client.variables["pool-f1"] = {"EXISTING": "value"}
-    rows = reset_function_pool(
+    rows, qualified_map = reset_function_pool(
         client,
         {"f1": "pool-f1", "f2": "pool-f2"},
         ["f1", "f2"],
@@ -52,6 +57,8 @@ def test_reset_function_pool_preserves_environment_and_adds_unique_token():
     assert client.variables["pool-f1"] == {"EXISTING": "value", "MINT_COLD_RESET_TOKEN": "token-1"}
     assert client.variables["pool-f2"] == {"MINT_COLD_RESET_TOKEN": "token-1"}
     assert all(row["last_update_status"] == "Successful" for row in rows)
+    assert qualified_map == {"f1": "pool-f1:1", "f2": "pool-f2:2"}
+    assert [row["published_version"] for row in rows] == ["1", "2"]
 
 
 def test_validate_controlled_cold_accepts_cold_warmup_then_hot_real_same_environment():
