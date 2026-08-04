@@ -1,5 +1,12 @@
-from mint.markov_policy import MarkovAction, MarkovPolicyAnalyzer, MarkovTransitionModel
-from mint.workloads import get_workload
+from mint.markov_policy import (
+    MarkovAction,
+    MarkovPolicyAnalyzer,
+    MarkovRewardModel,
+    MarkovState,
+    MarkovTransition,
+    MarkovTransitionModel,
+)
+from mint.workloads import WorkflowDAG, get_workload
 
 
 def _config(budget=2):
@@ -92,3 +99,48 @@ def test_adaptive_branch_uses_empirical_probability_map():
     assert {transition.next_state.frontier for transition in transitions} == {
         ("f2",), ("f3",), ("f4",), ("f5",)
     }
+
+
+def test_reward_cost_uses_one_cold_charge_and_ms_equivalent_warmup_terms():
+    state = MarkovState(tuple(), tuple(), tuple(), None, 1)
+    transition = MarkovTransition(1.0, state, ("f1",), ("f1",), ("f2",))
+    model = MarkovRewardModel(
+        cold_start_penalty_ms=800,
+        warmup_duration_ms=100,
+        warmup_cost_weight=0.1,
+        cold_start_penalty_weight=1.0,
+        wasted_warmup_penalty_weight=0.2,
+    )
+    # 800 cold + 10 resource + 20 wasted; cold latency must not be doubled.
+    assert model.cost(MarkovAction(("f2",)), transition) == 830
+    assert model.reward(MarkovAction(("f2",)), transition) == -830
+
+
+def test_offline_gain_is_q_cost_difference_and_can_reject_expensive_warmup():
+    cheap = MarkovPolicyAnalyzer(get_workload("chain"), _config(budget=1), budget=1)
+    initial = cheap.transition_model.initial_state()
+    cheap.analyze()
+    assert cheap.marginal_gain(initial, "f2") > 0
+    assert cheap.marginal_gain(initial, "f2") == (
+        cheap.q_costs[(initial, MarkovAction(tuple()))]
+        - cheap.q_costs[(initial, MarkovAction(("f2",)))]
+    )
+
+    expensive_config = _config(budget=1)
+    expensive_config["planner"]["warmup_cost_weight"] = 20.0
+    expensive = MarkovPolicyAnalyzer(get_workload("chain"), expensive_config, budget=1)
+    expensive_initial = expensive.transition_model.initial_state()
+    expensive.analyze()
+    assert expensive.marginal_gain(expensive_initial, "f2") < 0
+    assert all(intent.logical_name != "f2" for intent in expensive.generate_intents())
+
+
+def test_generic_reachability_does_not_depend_on_function_names():
+    dag = WorkflowDAG(
+        name="custom",
+        nodes=["root", "chosen", "later", "other"],
+        edges=[("root", "chosen"), ("chosen", "later"), ("root", "other")],
+        entry_nodes=["root"],
+        terminal_nodes=["later", "other"],
+    )
+    assert dag.reachable_from(["chosen"]) == {"chosen", "later"}

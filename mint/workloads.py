@@ -58,6 +58,19 @@ class WorkflowDAG:
 
         return {node: len(visit(node, set())) for node in self.nodes}
 
+    def reachable_from(self, start_nodes: list[str] | tuple[str, ...], excluded: set[str] | None = None) -> set[str]:
+        """Return topology-reachable nodes without workload-name special cases."""
+        excluded = excluded or set()
+        reachable: set[str] = set()
+        queue = [node for node in start_nodes if node not in excluded]
+        while queue:
+            node = queue.pop(0)
+            if node in reachable or node in excluded:
+                continue
+            reachable.add(node)
+            queue.extend(self.successors.get(node, []))
+        return reachable
+
     def next_nodes(self, node: str, context: dict | None = None) -> list[str]:
         if node != "f1":
             return self.successors[node]

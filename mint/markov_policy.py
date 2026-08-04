@@ -39,18 +39,32 @@ class MarkovTransition:
 @dataclass(frozen=True)
 class MarkovRewardModel:
     cold_start_penalty_ms: float
-    warmup_cost: float
+    warmup_duration_ms: float
+    warmup_cost_weight: float
     cold_start_penalty_weight: float
     wasted_warmup_penalty_weight: float
-    missed_warmup_penalty_weight: float
+
+    def cost(self, action: MarkovAction, transition: MarkovTransition) -> float:
+        """Return one transition's cost in milliseconds-equivalent units.
+
+        Cold latency is charged exactly once.  Resource and wasted-warmup
+        penalties are weights applied to the measured/configured warmup
+        duration, so every term has the same unit.
+        """
+        cold_cost = self.cold_start_penalty_weight * self.cold_start_penalty_ms * len(
+            transition.cold_functions
+        )
+        warm_cost = self.warmup_cost_weight * self.warmup_duration_ms * len(action.warmup_functions)
+        wasted_cost = (
+            self.wasted_warmup_penalty_weight
+            * self.warmup_duration_ms
+            * len(transition.wasted_warmups)
+        )
+        return cold_cost + warm_cost + wasted_cost
 
     def reward(self, action: MarkovAction, transition: MarkovTransition) -> float:
-        cold_cost = self.cold_start_penalty_weight * self.cold_start_penalty_ms * len(transition.cold_functions)
-        path_cost = self.cold_start_penalty_ms * len(transition.cold_functions)
-        warm_cost = self.warmup_cost * len(action.warmup_functions)
-        wasted_cost = self.wasted_warmup_penalty_weight * len(transition.wasted_warmups)
-        missed_cost = self.missed_warmup_penalty_weight * len(set(action.warmup_functions) & set(transition.cold_functions))
-        return -(cold_cost + path_cost + warm_cost + wasted_cost + missed_cost)
+        """Compatibility view for callers that maximize reward."""
+        return -self.cost(action, transition)
 
 
 class MarkovTransitionModel:
@@ -222,16 +236,25 @@ class MarkovPolicyAnalyzer:
         self.transition_model = MarkovTransitionModel(dag, config)
         self.reward_model = MarkovRewardModel(
             cold_start_penalty_ms=float(platform.get("default_cold_start_ms", 800)),
-            warmup_cost=float(planner_cfg.get("warmup_cost", 0.1)),
+            warmup_duration_ms=float(platform.get("default_warm_duration_ms", 100)),
+            warmup_cost_weight=float(planner_cfg.get("warmup_cost_weight", planner_cfg.get("warmup_cost", 0.1))),
             cold_start_penalty_weight=float(planner_cfg.get("cold_start_penalty_weight", 1.0)),
             wasted_warmup_penalty_weight=float(planner_cfg.get("wasted_warmup_penalty_weight", 0.2)),
-            missed_warmup_penalty_weight=float(planner_cfg.get("missed_warmup_penalty_weight", 0.5)),
         )
         self.policy: dict[MarkovState, MarkovAction] = {}
         self.values: dict[MarkovState, float] = {}
+        self.costs: dict[MarkovState, float] = {}
+        self.q_costs: dict[tuple[MarkovState, MarkovAction], float] = {}
 
     def enumerate_actions(self, state: MarkovState) -> list[MarkovAction]:
-        candidates = [node for node in self.dag.nodes if node not in state.completed]
+        # The current frontier is already due for invocation.  Treating it as
+        # prewarmable would let the model hide a blocking cold invocation as a
+        # zero-time warmup and make delaying every decision look cost-free.
+        candidates = [
+            node
+            for node in self.dag.nodes
+            if node not in state.completed and node not in state.frontier
+        ]
         actions = [MarkovAction(tuple())]
         max_size = min(max(0, self.budget), len(candidates))
         for size in range(1, max_size + 1):
@@ -239,30 +262,45 @@ class MarkovPolicyAnalyzer:
                 actions.append(MarkovAction(tuple(sorted(combo))))
         return actions
 
-    def analyze(self) -> dict[MarkovState, MarkovAction]:
-        initial = self.transition_model.initial_state()
+    def analyze(self, initial_state: MarkovState | None = None) -> dict[MarkovState, MarkovAction]:
+        initial = initial_state or self.transition_model.initial_state()
 
         @lru_cache(maxsize=None)
-        def value(state: MarkovState, depth: int) -> float:
+        def minimum_cost(state: MarkovState, depth: int) -> float:
             if depth >= self.horizon or (not state.frontier and not self.transition_model._reachable_from_state(state)):
+                self.costs[state] = 0.0
                 self.values[state] = 0.0
                 return 0.0
-            best_value = float("-inf")
+            best_cost = float("inf")
             best_action = MarkovAction(tuple())
             for action in self.enumerate_actions(state):
                 expected = 0.0
                 for transition in self.transition_model.transition(state, action):
-                    immediate = self.reward_model.reward(action, transition)
-                    expected += transition.probability * (immediate + value(transition.next_state, depth + 1))
-                if expected > best_value:
-                    best_value = expected
+                    immediate = self.reward_model.cost(action, transition)
+                    expected += transition.probability * (
+                        immediate + minimum_cost(transition.next_state, depth + 1)
+                    )
+                self.q_costs[(state, action)] = expected
+                if expected < best_cost:
+                    best_cost = expected
                     best_action = action
             self.policy[state] = best_action
-            self.values[state] = best_value
-            return best_value
+            self.costs[state] = best_cost
+            self.values[state] = -best_cost
+            return best_cost
 
-        value(initial, 0)
+        minimum_cost(initial, 0)
         return self.policy
+
+    def marginal_gain(self, state: MarkovState, node: str) -> float:
+        """Cost avoided by warming ``node`` instead of taking no action."""
+        if node in state.frontier:
+            return float("-inf")
+        no_op = MarkovAction(tuple())
+        warm = MarkovAction((node,))
+        return self.q_costs.get((state, no_op), float("inf")) - self.q_costs.get(
+            (state, warm), float("inf")
+        )
 
     def generate_intents(self) -> list[Any]:
         from mint.intent_planner import WarmupIntent
@@ -277,15 +315,19 @@ class MarkovPolicyAnalyzer:
         max_downstream = max(downstream.values() or [1])
         best_by_node: dict[str, tuple[MarkovState, float]] = {}
 
-        for state, action in self.policy.items():
-            value = self.values.get(state, 0.0)
-            for node in action.warmup_functions:
+        for state in self.policy:
+            for node in self.dag.nodes:
+                if node in state.completed:
+                    continue
+                gain = self.marginal_gain(state, node)
+                if gain <= 0:
+                    continue
                 current = best_by_node.get(node)
-                if current is None or value > current[1]:
-                    best_by_node[node] = (state, value)
+                if current is None or gain > current[1]:
+                    best_by_node[node] = (state, gain)
 
         intents = []
-        for node, (state, value) in best_by_node.items():
+        for node, (state, gain) in best_by_node.items():
             stage = stages.get(node, state.time_bucket)
             planned_time = float(state.time_bucket)
             criticality = 1.0 + downstream.get(node, 0) / max(max_downstream, 1)
@@ -298,7 +340,7 @@ class MarkovPolicyAnalyzer:
                     window_start_sec=max(0.0, planned_time - default_retention),
                     window_end_sec=planned_time + default_retention,
                     priority=int(round(criticality * 100)),
-                    offline_gain=round(max(0.0, -value), 3),
+                    offline_gain=round(gain, 3),
                     stage=stage,
                     criticality=round(criticality, 3),
                 )

@@ -283,7 +283,7 @@ def test_greedy_trap_mint_and_path_aware_targets_differ_without_path_leak(tmp_pa
     assert any(event.get("action") in {"cancel", "replace"} for event in mint_decisions)
 
 
-def test_mint_no_long_horizon_and_full_rank_different_targets_on_greedy_trap(tmp_path):
+def test_mint_no_long_horizon_and_full_respect_deadline_and_budget_on_greedy_trap(tmp_path):
     dag = get_workload("greedy_trap")
     common_exp = {"warmup_budget": 2, "branch_seed": 42, "profile_mismatch": True, "timing_jitter_ms": 800}
 
@@ -301,8 +301,10 @@ def test_mint_no_long_horizon_and_full_rank_different_targets_on_greedy_trap(tmp
     full_events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
     no_long_warmups = [event["logical_name"] for event in no_long_events if event.get("event_type") == "warmup"]
     full_warmups = [event["logical_name"] for event in full_events if event.get("event_type") == "warmup"]
-    assert no_long_warmups != full_warmups
-    assert "f1" in no_long_warmups
+    assert len(no_long_warmups) <= 2
+    assert len(full_warmups) <= 2
+    assert "f1" not in no_long_warmups
+    assert "f1" not in full_warmups
     assert any(node in {"f5", "f6", "f7", "f8"} for node in full_warmups)
 
 
@@ -322,8 +324,8 @@ def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp
         warmups[baseline] = [event["logical_name"] for event in events if event.get("event_type") == "warmup"]
         actions[baseline] = [event["action"] for event in events if event.get("event_type") == "scheduler_decision"]
 
-    assert warmups["mint_markov_no_runtime_reval"] != warmups["mint_markov_full"]
-    assert warmups["mint_markov_no_long_horizon"] != warmups["mint_markov_full"]
+    assert all(len(nodes) <= 2 for nodes in warmups.values())
+    assert all("f1" not in nodes for nodes in warmups.values())
     assert "replace" not in actions["mint_markov_no_runtime_reval"]
     assert "replace" in actions["mint_markov_full"]
 

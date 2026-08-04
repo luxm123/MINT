@@ -427,10 +427,9 @@ class MintController:
         workflow_index: int,
         executor: ThreadPoolExecutor,
     ) -> tuple[Future[dict[str, Any]], WarmupIntent, float] | None:
-        leaf_by_branch = {"f2": "f6", "f3": "f7", "f4": "f8", "f5": "f9"}
-        if observed_branch not in leaf_by_branch:
-            raise ValueError(f"invalid adaptive branch: {observed_branch}")
-        actual_targets = [observed_branch, leaf_by_branch[observed_branch]]
+        if observed_branch not in self.dag.nodes:
+            raise ValueError(f"observed branch is not a DAG node: {observed_branch}")
+        actual_targets = self.dag.reachable_from([observed_branch])
         executed = list(self._executed_warmups_by_run.get(run_id, []))
         intent_by_node = {intent.logical_name: intent for intent in intents}
         probabilities = json.dumps(self._active_model_snapshot.get("probabilities", {}), sort_keys=True)
@@ -450,7 +449,9 @@ class MintController:
         for node in executed:
             if node in actual_targets:
                 continue
-            intent = intent_by_node[node]
+            intent = intent_by_node.get(node)
+            if intent is None:
+                continue
             append_jsonl(
                 self.events_path,
                 SchedulerDecision(
@@ -470,10 +471,53 @@ class MintController:
             )
 
         remaining_budget = self._warmup_budget() - len(executed)
-        leaf = leaf_by_branch[observed_branch]
-        if remaining_budget <= 0 or leaf in executed or self._hot_until.get(leaf, 0.0) > monotonic_sec():
+        if remaining_budget <= 0:
             return None
-        intent = intent_by_node[leaf]
+        now = monotonic_sec()
+        candidates = [
+            intent_by_node[node]
+            for node in actual_targets - {observed_branch}
+            if node in intent_by_node
+            and node not in executed
+            and self._hot_until.get(node, 0.0) <= now
+        ]
+        if not candidates:
+            return None
+        from mint.markov_policy import MarkovPolicyAnalyzer, MarkovState
+
+        runtime_analyzer = MarkovPolicyAnalyzer(
+            self.dag,
+            self._planner_config(),
+            budget=remaining_budget,
+        )
+        retention = runtime_analyzer.transition_model.retention_buckets
+        runtime_state = MarkovState(
+            frontier=(observed_branch,),
+            hot_ttl=tuple(sorted((node, retention) for node in executed)),
+            completed=tuple(sorted(set(self.dag.entry_nodes))),
+            branch_path=observed_branch,
+            time_bucket=1,
+        )
+        runtime_analyzer.analyze(runtime_state)
+        runtime_gains = {
+            candidate.logical_name: runtime_analyzer.marginal_gain(runtime_state, candidate.logical_name)
+            for candidate in candidates
+        }
+        candidates = [candidate for candidate in candidates if runtime_gains[candidate.logical_name] > 0]
+        if not candidates:
+            return None
+        # Branch observation conditions the state before recomputing every
+        # reachable candidate's Q(no-op)-Q(warm node) marginal gain.
+        intent = min(
+            candidates,
+            key=lambda item: (
+                -runtime_gains[item.logical_name],
+                self.dag.stages().get(item.logical_name, item.stage),
+                item.logical_name,
+            ),
+        )
+        target = intent.logical_name
+        runtime_gain = runtime_gains[target]
         replaced = next((old for old in executed if old not in actual_targets), "")
         append_jsonl(
             self.events_path,
@@ -482,10 +526,10 @@ class MintController:
                 run_id=run_id,
                 intent_id=intent.intent_id,
                 function_name=intent.function_name,
-                logical_name=leaf,
+                logical_name=target,
                 action="replace",
                 action_reason="runtime_branch_observation_parallel_successor_warmup",
-                gain=intent.offline_gain,
+                gain=runtime_gain,
                 planned_time_sec=intent.planned_time_sec,
                 decision_phase="runtime_after_f1",
                 model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
