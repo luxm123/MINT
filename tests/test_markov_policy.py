@@ -75,3 +75,20 @@ def test_greedy_trap_markov_transition_branches_then_converges():
     assert all(t.next_state.frontier in {("f2",), ("f3",), ("f4",)} for t in transitions)
     after_branch = model.transition(transitions[0].next_state, MarkovAction(tuple()))[0].next_state
     assert after_branch.frontier == ("f5",)
+
+
+def test_adaptive_branch_uses_empirical_probability_map():
+    config = _config()
+    config["planner"]["branch_probabilities"] = {"f2": 0.7, "f3": 0.1, "f4": 0.1, "f5": 0.1}
+    config["aws"]["lambda_functions"]["f9"] = "mint-f9"
+    model = MarkovTransitionModel(get_workload("adaptive_branch"), config)
+    transitions = model.transition(model.initial_state(), MarkovAction(tuple()))
+    assert {transition.next_state.branch_path: transition.probability for transition in transitions} == {
+        "f2": 0.7,
+        "f3": 0.1,
+        "f4": 0.1,
+        "f5": 0.1,
+    }
+    assert {transition.next_state.frontier for transition in transitions} == {
+        ("f2",), ("f3",), ("f4",), ("f5",)
+    }

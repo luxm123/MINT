@@ -471,3 +471,50 @@ def test_no_executed_warmup_never_reports_warmup_overrun(tmp_path, monkeypatch):
 
     assert result["warmup_count"] == 0
     assert result["warmup_overrun_ms"] == 0.0
+
+
+def test_adaptive_markov_learns_from_past_then_replaces_after_f1(tmp_path):
+    dag = get_workload("adaptive_branch")
+    config = _config(tmp_path, "mint_markov_full")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_trace": ["f4"]})
+    config["planner"] = {
+        "type": "markov",
+        "horizon": 5,
+        "historical_branch_records": ["f2"] * 70 + ["f3"] * 10 + ["f4"] * 10 + ["f5"] * 10,
+    }
+    controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+
+    controller.run_once(0)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    model_events = [event for event in events if event.get("event_type") == "branch_model"]
+    decisions = [event for event in events if event.get("event_type") == "scheduler_decision"]
+    warmups = [event for event in events if event.get("event_type") == "warmup"]
+
+    probabilities = json.loads(model_events[0]["branch_probabilities"])
+    assert probabilities == {"f2": 0.7, "f3": 0.1, "f4": 0.1, "f5": 0.1}
+    assert {event["logical_name"] for event in warmups if event["action"] == "execute"} == {"f2", "f6"}
+    assert {event["logical_name"] for event in warmups if event["action"] == "replace"} == {"f4", "f8"}
+    assert any(
+        event["decision_phase"] == "runtime_after_f1"
+        and event["logical_name"] == "f2"
+        and event["action"] == "cancel"
+        for event in decisions
+    )
+    assert any(
+        event["decision_phase"] == "runtime_after_f1"
+        and event["logical_name"] == "f8"
+        and event["action"] == "replace"
+        for event in decisions
+    )
+    invocation_path = [event["logical_name"] for event in events if event.get("event_type") == "invocation"]
+    assert invocation_path == ["f1", "f4", "f8"]
+
+    controller.run_once(1)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    next_initial = [
+        event for event in events
+        if event.get("event_type") == "branch_model" and event.get("decision_phase") == "initial"
+    ][1]
+    assert next_initial["history_size"] == 101
+    assert json.loads(next_initial["branch_counts"])["f4"] == 11

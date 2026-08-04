@@ -68,6 +68,8 @@ class WorkflowDAG:
         if self.name == "wide_branch":
             choices = ["f2", "f3", "f4", "f5"]
             return [choices[int(context.get("branch_index", 0)) % len(choices)]]
+        if self.name == "adaptive_branch":
+            return [str(context.get("branch", "f2"))]
         if self.name == "greedy_trap":
             choices = ["f2", "f3", "f4"]
             return [choices[int(context.get("branch_index", 0)) % len(choices)]]
@@ -129,6 +131,19 @@ WORKLOADS: dict[str, WorkflowDAG] = {
         entry_nodes=["f1"],
         terminal_nodes=["f7"],
         branch_rules={"f1": "runtime selects exactly one of f2/f3/f4/f5; profile_mismatch can skew the realized branch"},
+    ),
+    "adaptive_branch": WorkflowDAG(
+        name="adaptive_branch",
+        nodes=["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9"],
+        edges=[
+            ("f1", "f2"), ("f2", "f6"),
+            ("f1", "f3"), ("f3", "f7"),
+            ("f1", "f4"), ("f4", "f8"),
+            ("f1", "f5"), ("f5", "f9"),
+        ],
+        entry_nodes=["f1"],
+        terminal_nodes=["f6", "f7", "f8", "f9"],
+        branch_rules={"f1": "runtime selects one branch; each branch has a disjoint successor"},
     ),
     "deep_mixed": WorkflowDAG(
         name="deep_mixed",

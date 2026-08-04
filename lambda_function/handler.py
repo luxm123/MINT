@@ -43,6 +43,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         "status": "ok",
         "error_type": "",
         "error_message": "",
+        "observed_branch": event.get("branch", ""),
     }
     return json.loads(json.dumps(result))
 

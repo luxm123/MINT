@@ -30,6 +30,7 @@ class InvocationEvent(EventBase):
     status: str = "ok"
     error_type: str = ""
     error_message: str = ""
+    observed_branch: str = ""
 
 
 @dataclass
@@ -61,6 +62,19 @@ class SchedulerDecision(EventBase):
     action_reason: str = ""
     gain: float = 0.0
     planned_time_sec: float = 0.0
+    decision_phase: str = "initial"
+    model_history_size: int = 0
+    branch_probabilities: str = "{}"
+    supersedes_intent_id: str = ""
+
+
+@dataclass
+class BranchModelEvent(EventBase):
+    decision_phase: str = "initial"
+    history_size: int = 0
+    branch_counts: str = "{}"
+    branch_probabilities: str = "{}"
+    observed_branch: str = ""
 
 
 @dataclass

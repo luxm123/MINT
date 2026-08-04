@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from mint.aws_client import invoke_lambda
-from mint.events import InvocationEvent, SchedulerDecision, WarmupEvent, WorkflowRunSummary
+from mint.branch_history import BranchHistoryModel
+from mint.events import BranchModelEvent, InvocationEvent, SchedulerDecision, WarmupEvent, WorkflowRunSummary
 from mint.intent_planner import WarmupIntent, plan_intents
 from mint.metrics import compute_summary
 from mint.scheduler import WarmupAction, schedule_intents
@@ -62,6 +63,7 @@ class MintController:
         self.summary_path = self.output_dir / "summary.json"
         self._hot_until: dict[str, float] = {}
         self._warmups: set[str] = set()
+        self._executed_warmups_by_run: dict[str, list[str]] = {}
         self._last_environment_ids: dict[str, str] = {}
         self.planner_type = self._planner_type_for_baseline()
         self._workflow_index = 0
@@ -74,6 +76,10 @@ class MintController:
         missing_nodes = [node for node in self.dag.nodes if node not in self.function_map]
         if not self.dry_run and missing_nodes:
             raise ValueError(f"Lambda function pool {self.function_pool!r} is missing DAG nodes: {', '.join(missing_nodes)}")
+        self._branch_history = BranchHistoryModel.from_config(
+            self._branch_names(), config.get("planner", {})
+        ) if self._branch_names() else None
+        self._active_model_snapshot: dict[str, Any] = {}
 
     def run(self, repetitions: int) -> dict[str, Any]:
         summaries = [self.run_once(index) for index in range(repetitions)]
@@ -90,6 +96,7 @@ class MintController:
         """Forget controller-inferred heat after an external function-pool reset."""
         self._hot_until.clear()
         self._warmups.clear()
+        self._executed_warmups_by_run.clear()
 
     def observed_environment_ids(self) -> dict[str, str]:
         return dict(self._last_environment_ids)
@@ -104,10 +111,23 @@ class MintController:
         planned_arrival_time: str = "",
     ) -> dict[str, Any]:
         run_id = new_id("run")
-        context = self._run_context(index)
+        self._active_model_snapshot = self._branch_history.snapshot() if self._branch_history else {}
         planner_config = self._planner_config()
         intents = plan_intents(self.dag, planner_config)
+        context = self._run_context(index)
         selected_nodes = self._resolve_path(context)
+        if self._active_model_snapshot:
+            append_jsonl(
+                self.events_path,
+                BranchModelEvent(
+                    event_type="branch_model",
+                    run_id=run_id,
+                    decision_phase="initial",
+                    history_size=int(self._active_model_snapshot["history_size"]),
+                    branch_counts=json.dumps(self._active_model_snapshot["counts"], sort_keys=True),
+                    branch_probabilities=json.dumps(self._active_model_snapshot["probabilities"], sort_keys=True),
+                ).to_dict(),
+            )
         initial_environment_ids = json.dumps(self._last_environment_ids, sort_keys=True)
         cold_count = 0
         warmup_count = 0
@@ -139,6 +159,8 @@ class MintController:
             now = monotonic_sec()
             was_warm = self._hot_until.get(logical, 0.0) > now
             payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
+            if logical == "f1" and self.dag.name == "adaptive_branch":
+                payload["branch"] = self._context_branch(context)
             response: dict[str, Any] = {}
             try:
                 response = invoke_lambda(
@@ -172,6 +194,7 @@ class MintController:
                         status="error",
                         error_type=observed["error_type"],
                         error_message=observed["error_message"],
+                        observed_branch=observed.get("observed_branch", ""),
                     ).to_dict(),
                 )
                 raise
@@ -195,8 +218,19 @@ class MintController:
                 status=observed["status"],
                 error_type=observed["error_type"],
                 error_message=observed["error_message"],
+                observed_branch=observed.get("observed_branch", ""),
             )
             append_jsonl(self.events_path, event.to_dict())
+            if logical == "f1" and self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
+                observed_branch = str(observed.get("observed_branch") or "")
+                expected_branch = self._context_branch(context)
+                if observed_branch != expected_branch:
+                    raise InvalidRealObservation(
+                        f"f1 branch observation mismatch: expected={expected_branch!r}, observed={observed_branch!r}"
+                    )
+                warmup_count += self._runtime_revise_after_branch(
+                    run_id, intents, observed_branch, index
+                )
 
         latency_ms = round((monotonic_sec() - planned_arrival_sec) * 1000.0, 3)
         workflow_end_time = utc_now_iso()
@@ -222,9 +256,14 @@ class MintController:
             initial_environment_ids=initial_environment_ids,
         )
         append_jsonl(self.events_path, summary_event.to_dict())
+        observed_branch = self._context_branch(context)
+        if self._branch_history and observed_branch:
+            self._branch_history.observe(observed_branch)
         return summary_event.to_dict()
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
+        if self.dag.name == "adaptive_branch":
+            intents = [intent for intent in intents if intent.logical_name not in self.dag.entry_nodes]
         if self.baseline == "path_aware_greedy":
             actions = self._path_aware_greedy_actions(intents)
         elif self.baseline == "oracle_path":
@@ -277,6 +316,9 @@ class MintController:
                 action_reason=action.action_reason,
                 gain=action.gain,
                 planned_time_sec=intent.planned_time_sec,
+                decision_phase="initial",
+                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                branch_probabilities=json.dumps(self._active_model_snapshot.get("probabilities", {}), sort_keys=True),
             )
             append_jsonl(self.events_path, decision.to_dict())
             if action.action_type != "execute":
@@ -350,7 +392,130 @@ class MintController:
             )
             append_jsonl(self.events_path, warmup_event.to_dict())
             count += 1
+            self._executed_warmups_by_run.setdefault(run_id, []).append(intent.logical_name)
         return count
+
+    def _runtime_revise_after_branch(
+        self,
+        run_id: str,
+        intents: list[WarmupIntent],
+        observed_branch: str,
+        workflow_index: int,
+    ) -> int:
+        leaf_by_branch = {"f2": "f6", "f3": "f7", "f4": "f8", "f5": "f9"}
+        if observed_branch not in leaf_by_branch:
+            raise ValueError(f"invalid adaptive branch: {observed_branch}")
+        actual_targets = [observed_branch, leaf_by_branch[observed_branch]][: self._warmup_budget()]
+        executed = list(self._executed_warmups_by_run.get(run_id, []))
+        intent_by_node = {intent.logical_name: intent for intent in intents}
+        probabilities = json.dumps(self._active_model_snapshot.get("probabilities", {}), sort_keys=True)
+
+        append_jsonl(
+            self.events_path,
+            BranchModelEvent(
+                event_type="branch_model",
+                run_id=run_id,
+                decision_phase="runtime_after_f1",
+                history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                branch_counts=json.dumps(self._active_model_snapshot.get("counts", {}), sort_keys=True),
+                branch_probabilities=probabilities,
+                observed_branch=observed_branch,
+            ).to_dict(),
+        )
+        for node in executed:
+            if node in actual_targets:
+                continue
+            intent = intent_by_node[node]
+            append_jsonl(
+                self.events_path,
+                SchedulerDecision(
+                    event_type="scheduler_decision",
+                    run_id=run_id,
+                    intent_id=intent.intent_id,
+                    function_name=intent.function_name,
+                    logical_name=node,
+                    action="cancel",
+                    action_reason="runtime_invalidated_after_f1_already_executed_wasted",
+                    gain=0.0,
+                    planned_time_sec=intent.planned_time_sec,
+                    decision_phase="runtime_after_f1",
+                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                    branch_probabilities=probabilities,
+                ).to_dict(),
+            )
+
+        replacements = 0
+        for node in actual_targets:
+            if node in executed:
+                continue
+            intent = intent_by_node[node]
+            replaced = next((old for old in executed if old not in actual_targets), "")
+            append_jsonl(
+                self.events_path,
+                SchedulerDecision(
+                    event_type="scheduler_decision",
+                    run_id=run_id,
+                    intent_id=intent.intent_id,
+                    function_name=intent.function_name,
+                    logical_name=node,
+                    action="replace",
+                    action_reason="runtime_branch_observation_replacement",
+                    gain=intent.offline_gain,
+                    planned_time_sec=intent.planned_time_sec,
+                    decision_phase="runtime_after_f1",
+                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                    branch_probabilities=probabilities,
+                    supersedes_intent_id=intent_by_node[replaced].intent_id if replaced else "",
+                ).to_dict(),
+            )
+            self._execute_runtime_warmup(run_id, intent, workflow_index)
+            replacements += 1
+        return replacements
+
+    def _execute_runtime_warmup(self, run_id: str, intent: WarmupIntent, workflow_index: int) -> None:
+        payload = {"function_name": intent.logical_name, "run_id": run_id, "invocation_type": "warmup", "sleep_ms": 1}
+        response = invoke_lambda(
+            intent.function_name,
+            payload,
+            invocation_type="RequestResponse",
+            dry_run=self.dry_run,
+            region_name=self.config.get("aws", {}).get("region"),
+        )
+        observed = self._observed_invocation_metrics(
+            response,
+            self._hot_until.get(intent.logical_name, 0.0) > monotonic_sec(),
+            workflow_index,
+            intent.stage,
+        )
+        self._last_environment_ids[intent.logical_name] = observed["execution_environment_id"]
+        self._hot_until[intent.logical_name] = monotonic_sec() + float(
+            self.config.get("platform", {}).get("default_retention_sec", 300)
+        )
+        self._warmups.add(f"{run_id}:{intent.logical_name}")
+        self._executed_warmups_by_run.setdefault(run_id, []).append(intent.logical_name)
+        append_jsonl(
+            self.events_path,
+            WarmupEvent(
+                event_type="warmup",
+                run_id=run_id,
+                function_name=intent.function_name,
+                logical_name=intent.logical_name,
+                intent_id=intent.intent_id,
+                action="replace",
+                useful=True,
+                action_reason="runtime_branch_observation_replacement",
+                gain=intent.offline_gain,
+                invocation_type="warmup",
+                cold_start=observed["cold_start"],
+                request_id=observed["request_id"],
+                execution_environment_id=observed["execution_environment_id"],
+                latency_ms=observed["latency_ms"],
+                function_duration_ms=observed["function_duration_ms"],
+                status=observed["status"],
+                error_type=observed["error_type"],
+                error_message=observed["error_message"],
+            ).to_dict(),
+        )
 
     def _planner_type_for_baseline(self) -> str:
         if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
@@ -371,7 +536,28 @@ class MintController:
         planner_config = copy.deepcopy(self.config)
         planner_config.setdefault("planner", {})["type"] = self._intent_planner_type()
         planner_config.setdefault("aws", {})["lambda_functions"] = dict(self.function_map)
+        if self._active_model_snapshot:
+            planner_config.setdefault("planner", {})["branch_probabilities"] = dict(
+                self._active_model_snapshot["probabilities"]
+            )
         return planner_config
+
+    def _branch_names(self) -> tuple[str, ...]:
+        if self.dag.name in {"wide_branch", "adaptive_branch"}:
+            return ("f2", "f3", "f4", "f5")
+        if self.dag.name == "greedy_trap":
+            return ("f2", "f3", "f4")
+        if self.dag.name in {"branch", "mixed", "deep_mixed"}:
+            return ("left", "right")
+        return tuple()
+
+    @staticmethod
+    def _context_branch(context: dict[str, Any]) -> str:
+        if "branch" in context:
+            return str(context["branch"])
+        if "branch_index" in context:
+            return ("f2", "f3", "f4", "f5")[int(context["branch_index"]) % 4]
+        return ""
 
     def _intent_planner_type(self) -> str:
         if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
@@ -403,6 +589,13 @@ class MintController:
         elif self.dag.name == "greedy_trap":
             for node in {"f2", "f3", "f4"} & set(self.dag.nodes):
                 probabilities[node] = 1.0 / 3.0
+        elif self.dag.name == "adaptive_branch":
+            learned = self._active_model_snapshot.get("probabilities", {})
+            leaf_by_branch = {"f2": "f6", "f3": "f7", "f4": "f8", "f5": "f9"}
+            for branch, leaf in leaf_by_branch.items():
+                probability = float(learned.get(branch, 0.25))
+                probabilities[branch] = probability
+                probabilities[leaf] = probability
         return probabilities
 
     def _runtime_path_benefit(self, intents: list[WarmupIntent]) -> dict[str, float]:
@@ -621,6 +814,21 @@ class MintController:
             if mismatch:
                 branch_index = (branch_index * 2 + 1) % 4
             return {"branch_index": branch_index}
+        if self.dag.name == "adaptive_branch":
+            trace = self.config.get("experiment", {}).get("branch_trace", [])
+            if trace:
+                return {"branch": str(trace[index % len(trace)])}
+            phases = self.config.get("experiment", {}).get("branch_probability_phases", [])
+            probabilities = None
+            for phase in phases:
+                if int(phase.get("start", 0)) <= index < int(phase.get("end", 2**31)):
+                    probabilities = phase.get("probabilities")
+                    break
+            probabilities = probabilities or {branch: 0.25 for branch in self._branch_names()}
+            rng = random.Random(f"{branch_seed}:{index}")
+            branches = list(self._branch_names())
+            weights = [max(0.0, float(probabilities.get(branch, 0.0))) for branch in branches]
+            return {"branch": rng.choices(branches, weights=weights, k=1)[0]}
         if self.dag.name == "greedy_trap":
             mismatch = bool(self.config.get("experiment", {}).get("profile_mismatch", False))
             branch_index = (index + branch_seed) % 3
@@ -645,6 +853,7 @@ class MintController:
         if self.dry_run:
             latency_ms = self._simulated_latency_ms(was_warm)
             latency_ms += self._timing_jitter_ms(workflow_index, stage)
+            dry_payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
             return {
                 "latency_ms": round(latency_ms, 3),
                 "function_duration_ms": round(latency_ms, 3),
@@ -654,6 +863,7 @@ class MintController:
                 "status": "ok",
                 "error_type": "",
                 "error_message": "",
+                "observed_branch": str(dry_payload.get("observed_branch") or dry_payload.get("branch") or ""),
             }
 
         payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
@@ -690,6 +900,7 @@ class MintController:
             "status": status,
             "error_type": str(payload.get("error_type") or function_error),
             "error_message": str(payload.get("error_message") or ""),
+            "observed_branch": str(payload.get("observed_branch") or ""),
         }
 
     def _failed_observation(self, response: dict[str, Any], exc: Exception) -> dict[str, Any]:

@@ -11,3 +11,11 @@ def test_lambda_handler_entrypoint_and_type_alias():
     assert result["execution_environment_id"]
     assert result["request_id"] == ""
     assert result["status"] == "ok"
+
+
+def test_lambda_handler_echoes_observed_branch():
+    result = lambda_module.lambda_handler(
+        {"function_name": "f1", "run_id": "r2", "invocation_type": "real", "branch": "f4"},
+        None,
+    )
+    assert result["observed_branch"] == "f4"

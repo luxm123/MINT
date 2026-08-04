@@ -62,6 +62,10 @@ class MarkovTransitionModel:
         bucket_sec = max(1.0, float(planner_cfg.get("retention_bucket_sec", 60)))
         self.retention_buckets = max(1, int(round(retention_sec / bucket_sec)))
         self.branch_probability_left = float(planner_cfg.get("branch_probability_left", 0.5))
+        self.branch_probabilities = {
+            str(name): float(probability)
+            for name, probability in planner_cfg.get("branch_probabilities", {}).items()
+        }
 
     def initial_state(self) -> MarkovState:
         return MarkovState(
@@ -116,12 +120,21 @@ class MarkovTransitionModel:
             left = min(max(self.branch_probability_left, 0.0), 1.0)
             return [(left, "left"), (1.0 - left, "right")]
         if self.dag.name == "wide_branch" and "f1" in called and current_branch is None:
-            probability = 1.0 / 4.0
-            return [(probability, branch) for branch in ("f2", "f3", "f4", "f5")]
+            return self._multi_branch_options(("f2", "f3", "f4", "f5"))
+        if self.dag.name == "adaptive_branch" and "f1" in called and current_branch is None:
+            return self._multi_branch_options(("f2", "f3", "f4", "f5"))
         if self.dag.name == "greedy_trap" and "f1" in called and current_branch is None:
             probability = 1.0 / 3.0
             return [(probability, branch) for branch in ("f2", "f3", "f4")]
         return [(1.0, current_branch)]
+
+    def _multi_branch_options(self, branches: tuple[str, ...]) -> list[tuple[float, str]]:
+        weights = [max(0.0, self.branch_probabilities.get(branch, 1.0 / len(branches))) for branch in branches]
+        total = sum(weights)
+        if total <= 0:
+            weights = [1.0] * len(branches)
+            total = float(len(branches))
+        return [(weight / total, branch) for branch, weight in zip(branches, weights)]
 
     def _next_frontier(self, completed: tuple[str, ...], called: tuple[str, ...], branch_path: str | None) -> tuple[str, ...]:
         completed_set = set(completed)
@@ -132,6 +145,8 @@ class MarkovTransitionModel:
             elif self.dag.name in {"mixed", "deep_mixed"} and node == "f1":
                 candidates.update(["f2"] if branch_path == "left" else ["f3"])
             elif self.dag.name == "wide_branch" and node == "f1":
+                candidates.update([branch_path or "f2"])
+            elif self.dag.name == "adaptive_branch" and node == "f1":
                 candidates.update([branch_path or "f2"])
             elif self.dag.name == "greedy_trap" and node == "f1":
                 candidates.update([branch_path or "f2"])
@@ -182,6 +197,8 @@ class MarkovTransitionModel:
             elif self.dag.name in {"mixed", "deep_mixed"} and node == "f1":
                 children = ["f2"] if state.branch_path == "left" else ["f3"] if state.branch_path == "right" else self.dag.successors[node]
             elif self.dag.name == "wide_branch" and node == "f1":
+                children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4", "f5"} else self.dag.successors[node]
+            elif self.dag.name == "adaptive_branch" and node == "f1":
                 children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4", "f5"} else self.dag.successors[node]
             elif self.dag.name == "greedy_trap" and node == "f1":
                 children = [state.branch_path] if state.branch_path in {"f2", "f3", "f4"} else self.dag.successors[node]
