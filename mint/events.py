@@ -51,6 +51,8 @@ class WarmupEvent(EventBase):
     status: str = "ok"
     error_type: str = ""
     error_message: str = ""
+    overlap_duration_ms: float = 0.0
+    blocking_wait_ms: float = 0.0
 
 
 @dataclass

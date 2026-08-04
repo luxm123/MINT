@@ -493,11 +493,12 @@ def test_adaptive_markov_learns_from_past_then_replaces_after_f1(tmp_path):
 
     probabilities = json.loads(model_events[0]["branch_probabilities"])
     assert probabilities == {"f2": 0.7, "f3": 0.1, "f4": 0.1, "f5": 0.1}
-    assert {event["logical_name"] for event in warmups if event["action"] == "execute"} == {"f2", "f6"}
-    assert {event["logical_name"] for event in warmups if event["action"] == "replace"} == {"f4", "f8"}
+    assert {event["logical_name"] for event in warmups if event["action"] == "execute"} == {"f6"}
+    assert {event["logical_name"] for event in warmups if event["action"] == "replace"} == {"f8"}
+    assert len(warmups) == 2
     assert any(
         event["decision_phase"] == "runtime_after_f1"
-        and event["logical_name"] == "f2"
+        and event["logical_name"] == "f6"
         and event["action"] == "cancel"
         for event in decisions
     )
@@ -518,3 +519,41 @@ def test_adaptive_markov_learns_from_past_then_replaces_after_f1(tmp_path):
     ][1]
     assert next_initial["history_size"] == 101
     assert json.loads(next_initial["branch_counts"])["f4"] == 11
+
+
+def test_adaptive_runtime_warmup_overlaps_branch_work_and_respects_total_budget(tmp_path, monkeypatch):
+    import time
+
+    def timed_dry_invoke(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        logical = payload["function_name"]
+        if payload["invocation_type"] == "warmup" and logical == "f8":
+            time.sleep(0.05)
+        elif payload["invocation_type"] == "real" and logical == "f4":
+            time.sleep(0.06)
+        else:
+            time.sleep(0.001)
+        return {"dry_run": True, "function_name": function_name, "payload": payload, "status_code": 200}
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", timed_dry_invoke)
+    dag = get_workload("adaptive_branch")
+    config = _config(tmp_path, "mint_markov_full")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_trace": ["f4"], "warmup_lead_sec": 0.02})
+    config["planner"] = {
+        "type": "markov",
+        "horizon": 5,
+        "historical_branch_records": ["f2"] * 7 + ["f3", "f4", "f5"],
+    }
+    controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+    planned = controller_mod.monotonic_sec() + 0.02
+
+    result = controller.run_once(0, planned_arrival_sec=planned)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    warmups = [event for event in events if event.get("event_type") == "warmup"]
+    runtime = next(event for event in warmups if event["action"] == "replace")
+
+    assert result["warmup_count"] == 2
+    assert len(warmups) == 2
+    assert runtime["logical_name"] == "f8"
+    assert runtime["overlap_duration_ms"] >= 45
+    assert runtime["blocking_wait_ms"] < 15

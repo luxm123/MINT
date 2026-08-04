@@ -5,6 +5,7 @@ import copy
 import json
 import random
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -154,7 +155,14 @@ class MintController:
             else 0.0
         )
         stages = self.dag.stages()
+        runtime_executor: ThreadPoolExecutor | None = None
+        runtime_pending: tuple[Future[dict[str, Any]], WarmupIntent, float] | None = None
+        if self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
+            runtime_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mint-runtime-warmup")
         for logical in selected_nodes:
+            if runtime_pending and runtime_pending[1].logical_name == logical:
+                self._complete_runtime_warmup(run_id, runtime_pending)
+                runtime_pending = None
             function_name = self.function_map.get(logical, logical)
             now = monotonic_sec()
             was_warm = self._hot_until.get(logical, 0.0) > now
@@ -228,9 +236,25 @@ class MintController:
                     raise InvalidRealObservation(
                         f"f1 branch observation mismatch: expected={expected_branch!r}, observed={observed_branch!r}"
                     )
-                warmup_count += self._runtime_revise_after_branch(
-                    run_id, intents, observed_branch, index
+                if runtime_executor is None:
+                    raise RuntimeError("adaptive runtime executor was not initialized")
+                runtime_pending = self._runtime_revise_after_branch(
+                    run_id, intents, observed_branch, index, runtime_executor
                 )
+                warmup_count += int(runtime_pending is not None)
+
+        if runtime_pending:
+            self._complete_runtime_warmup(run_id, runtime_pending)
+        if runtime_executor:
+            runtime_executor.shutdown(wait=True)
+        if (
+            self.dag.name == "adaptive_branch"
+            and self.baseline == "mint_markov_full"
+            and warmup_count > self._warmup_budget()
+        ):
+            raise RuntimeError(
+                f"real warmup budget exceeded: executed={warmup_count}, budget={self._warmup_budget()}"
+            )
 
         latency_ms = round((monotonic_sec() - planned_arrival_sec) * 1000.0, 3)
         workflow_end_time = utc_now_iso()
@@ -299,7 +323,7 @@ class MintController:
             actions = schedule_intents(
                 intents,
                 runtime_state,
-                int(self.config.get("experiment", {}).get("warmup_budget", 1)),
+                self._initial_warmup_budget(),
                 self.config,
             )
 
@@ -401,11 +425,12 @@ class MintController:
         intents: list[WarmupIntent],
         observed_branch: str,
         workflow_index: int,
-    ) -> int:
+        executor: ThreadPoolExecutor,
+    ) -> tuple[Future[dict[str, Any]], WarmupIntent, float] | None:
         leaf_by_branch = {"f2": "f6", "f3": "f7", "f4": "f8", "f5": "f9"}
         if observed_branch not in leaf_by_branch:
             raise ValueError(f"invalid adaptive branch: {observed_branch}")
-        actual_targets = [observed_branch, leaf_by_branch[observed_branch]][: self._warmup_budget()]
+        actual_targets = [observed_branch, leaf_by_branch[observed_branch]]
         executed = list(self._executed_warmups_by_run.get(run_id, []))
         intent_by_node = {intent.logical_name: intent for intent in intents}
         probabilities = json.dumps(self._active_model_snapshot.get("probabilities", {}), sort_keys=True)
@@ -444,35 +469,35 @@ class MintController:
                 ).to_dict(),
             )
 
-        replacements = 0
-        for node in actual_targets:
-            if node in executed:
-                continue
-            intent = intent_by_node[node]
-            replaced = next((old for old in executed if old not in actual_targets), "")
-            append_jsonl(
-                self.events_path,
-                SchedulerDecision(
-                    event_type="scheduler_decision",
-                    run_id=run_id,
-                    intent_id=intent.intent_id,
-                    function_name=intent.function_name,
-                    logical_name=node,
-                    action="replace",
-                    action_reason="runtime_branch_observation_replacement",
-                    gain=intent.offline_gain,
-                    planned_time_sec=intent.planned_time_sec,
-                    decision_phase="runtime_after_f1",
-                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                    branch_probabilities=probabilities,
-                    supersedes_intent_id=intent_by_node[replaced].intent_id if replaced else "",
-                ).to_dict(),
-            )
-            self._execute_runtime_warmup(run_id, intent, workflow_index)
-            replacements += 1
-        return replacements
+        remaining_budget = self._warmup_budget() - len(executed)
+        leaf = leaf_by_branch[observed_branch]
+        if remaining_budget <= 0 or leaf in executed or self._hot_until.get(leaf, 0.0) > monotonic_sec():
+            return None
+        intent = intent_by_node[leaf]
+        replaced = next((old for old in executed if old not in actual_targets), "")
+        append_jsonl(
+            self.events_path,
+            SchedulerDecision(
+                event_type="scheduler_decision",
+                run_id=run_id,
+                intent_id=intent.intent_id,
+                function_name=intent.function_name,
+                logical_name=leaf,
+                action="replace",
+                action_reason="runtime_branch_observation_parallel_successor_warmup",
+                gain=intent.offline_gain,
+                planned_time_sec=intent.planned_time_sec,
+                decision_phase="runtime_after_f1",
+                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                branch_probabilities=probabilities,
+                supersedes_intent_id=intent_by_node[replaced].intent_id if replaced else "",
+            ).to_dict(),
+        )
+        started = monotonic_sec()
+        future = executor.submit(self._invoke_runtime_warmup, run_id, intent, workflow_index)
+        return future, intent, started
 
-    def _execute_runtime_warmup(self, run_id: str, intent: WarmupIntent, workflow_index: int) -> None:
+    def _invoke_runtime_warmup(self, run_id: str, intent: WarmupIntent, workflow_index: int) -> dict[str, Any]:
         payload = {"function_name": intent.logical_name, "run_id": run_id, "invocation_type": "warmup", "sleep_ms": 1}
         response = invoke_lambda(
             intent.function_name,
@@ -487,6 +512,17 @@ class MintController:
             workflow_index,
             intent.stage,
         )
+        return observed
+
+    def _complete_runtime_warmup(
+        self,
+        run_id: str,
+        pending: tuple[Future[dict[str, Any]], WarmupIntent, float],
+    ) -> None:
+        future, intent, overlap_started_sec = pending
+        wait_started_sec = monotonic_sec()
+        observed = future.result()
+        wait_ms = round((monotonic_sec() - wait_started_sec) * 1000.0, 3)
         self._last_environment_ids[intent.logical_name] = observed["execution_environment_id"]
         self._hot_until[intent.logical_name] = monotonic_sec() + float(
             self.config.get("platform", {}).get("default_retention_sec", 300)
@@ -503,7 +539,7 @@ class MintController:
                 intent_id=intent.intent_id,
                 action="replace",
                 useful=True,
-                action_reason="runtime_branch_observation_replacement",
+                action_reason="runtime_branch_observation_parallel_successor_warmup",
                 gain=intent.offline_gain,
                 invocation_type="warmup",
                 cold_start=observed["cold_start"],
@@ -514,8 +550,17 @@ class MintController:
                 status=observed["status"],
                 error_type=observed["error_type"],
                 error_message=observed["error_message"],
+                overlap_duration_ms=round((monotonic_sec() - overlap_started_sec) * 1000.0, 3),
+                blocking_wait_ms=wait_ms,
             ).to_dict(),
         )
+
+    def _initial_warmup_budget(self) -> int:
+        total = self._warmup_budget()
+        if self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
+            configured = int(self.config.get("experiment", {}).get("adaptive_initial_warmup_budget", 1))
+            return max(0, min(total, configured))
+        return total
 
     def _planner_type_for_baseline(self) -> str:
         if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
