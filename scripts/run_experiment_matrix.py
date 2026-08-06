@@ -47,6 +47,9 @@ SUMMARY_FIELDS = [
     "useful_warmup_ratio",
     "execute_count",
     "delay_count",
+    "cancel_pending_count",
+    "invalidate_executed_count",
+    "replacement_warmup_count",
     "cancel_count",
     "replace_count",
 ]

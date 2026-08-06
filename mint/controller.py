@@ -27,6 +27,7 @@ SUPPORTED_BASELINES = {
     "static_dag",
     "static_dag_unlimited",
     "orion_like",
+    "xanadu_like",
     "path_aware_greedy",
     "oracle_path",
     "mint_offline",
@@ -83,7 +84,12 @@ class MintController:
         self._active_model_snapshot: dict[str, Any] = {}
 
     def run(self, repetitions: int) -> dict[str, Any]:
-        summaries = [self.run_once(index) for index in range(repetitions)]
+        reset_each_run = bool(self.config.get("experiment", {}).get("reset_runtime_state_each_run", False))
+        summaries = []
+        for index in range(repetitions):
+            if index > 0 and reset_each_run:
+                self.reset_runtime_state()
+            summaries.append(self.run_once(index))
         return self.finalize(summaries)
 
     def finalize(self, summaries: list[dict[str, Any]]) -> dict[str, Any]:
@@ -156,102 +162,103 @@ class MintController:
         )
         stages = self.dag.stages()
         runtime_executor: ThreadPoolExecutor | None = None
-        runtime_pending: tuple[Future[dict[str, Any]], WarmupIntent, float] | None = None
-        if self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
+        runtime_pending: tuple[Future[dict[str, Any]], WarmupIntent, float, float] | None = None
+        if self._runtime_replanning_enabled():
             runtime_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mint-runtime-warmup")
-        for logical in selected_nodes:
-            if runtime_pending and runtime_pending[1].logical_name == logical:
+        try:
+            for path_index, logical in enumerate(selected_nodes):
+                if runtime_pending and runtime_pending[1].logical_name == logical:
+                    self._complete_runtime_warmup(run_id, runtime_pending)
+                    runtime_pending = None
+                function_name = self.function_map.get(logical, logical)
+                now = monotonic_sec()
+                was_warm = self._hot_until.get(logical, 0.0) > now
+                payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
+                expected_branch = self._revealed_successor(logical, context)
+                if expected_branch:
+                    payload["branch"] = expected_branch
+                response: dict[str, Any] = {}
+                try:
+                    response = invoke_lambda(
+                        function_name=function_name,
+                        payload=payload,
+                        dry_run=self.dry_run,
+                        region_name=self.config.get("aws", {}).get("region"),
+                    )
+                    observed = self._observed_invocation_metrics(
+                        response=response,
+                        was_warm=was_warm,
+                        workflow_index=index,
+                        stage=stages.get(logical, 0),
+                    )
+                except Exception as exc:
+                    observed = self._failed_observation(response, exc)
+                    append_jsonl(
+                        self.events_path,
+                        InvocationEvent(
+                            event_type="invocation",
+                            run_id=run_id,
+                            function_name=function_name,
+                            logical_name=logical,
+                            invocation_type="real",
+                            cold_start=observed["cold_start"],
+                            request_id=observed["request_id"],
+                            execution_environment_id=observed["execution_environment_id"],
+                            latency_ms=observed["latency_ms"],
+                            function_duration_ms=observed["function_duration_ms"],
+                            stage=stages.get(logical, 0),
+                            status="error",
+                            error_type=observed["error_type"],
+                            error_message=observed["error_message"],
+                            observed_branch=observed.get("observed_branch", ""),
+                        ).to_dict(),
+                    )
+                    raise
+                latency_ms = observed["latency_ms"]
+                cold = observed["cold_start"]
+                cold_count += int(cold)
+                self._last_environment_ids[logical] = observed["execution_environment_id"]
+                self._hot_until[logical] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
+                event = InvocationEvent(
+                    event_type="invocation",
+                    run_id=run_id,
+                    function_name=function_name,
+                    logical_name=logical,
+                    invocation_type="real",
+                    cold_start=cold,
+                    request_id=observed["request_id"],
+                    execution_environment_id=observed["execution_environment_id"],
+                    latency_ms=latency_ms,
+                    function_duration_ms=observed["function_duration_ms"],
+                    stage=stages.get(logical, 0),
+                    status=observed["status"],
+                    error_type=observed["error_type"],
+                    error_message=observed["error_message"],
+                    observed_branch=observed.get("observed_branch", ""),
+                )
+                append_jsonl(self.events_path, event.to_dict())
+                if expected_branch and self._runtime_replanning_enabled():
+                    observed_branch = str(observed.get("observed_branch") or "")
+                    if observed_branch != expected_branch:
+                        raise InvalidRealObservation(
+                            f"branch observation mismatch at {logical}: "
+                            f"expected={expected_branch!r}, observed={observed_branch!r}"
+                        )
+                    if runtime_executor is None:
+                        raise RuntimeError("runtime warmup executor was not initialized")
+                    runtime_pending = self._runtime_revise_after_branch(
+                        run_id, intents, observed_branch, index, runtime_executor,
+                        completed_nodes=set(selected_nodes[: path_index + 1]),
+                    )
+                    warmup_count += int(runtime_pending is not None)
+
+            if runtime_pending:
                 self._complete_runtime_warmup(run_id, runtime_pending)
                 runtime_pending = None
-            function_name = self.function_map.get(logical, logical)
-            now = monotonic_sec()
-            was_warm = self._hot_until.get(logical, 0.0) > now
-            payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
-            if logical == "f1" and self.dag.name == "adaptive_branch":
-                payload["branch"] = self._context_branch(context)
-            response: dict[str, Any] = {}
-            try:
-                response = invoke_lambda(
-                    function_name=function_name,
-                    payload=payload,
-                    dry_run=self.dry_run,
-                    region_name=self.config.get("aws", {}).get("region"),
-                )
-                observed = self._observed_invocation_metrics(
-                    response=response,
-                    was_warm=was_warm,
-                    workflow_index=index,
-                    stage=stages.get(logical, 0),
-                )
-            except Exception as exc:
-                observed = self._failed_observation(response, exc)
-                append_jsonl(
-                    self.events_path,
-                    InvocationEvent(
-                        event_type="invocation",
-                        run_id=run_id,
-                        function_name=function_name,
-                        logical_name=logical,
-                        invocation_type="real",
-                        cold_start=observed["cold_start"],
-                        request_id=observed["request_id"],
-                        execution_environment_id=observed["execution_environment_id"],
-                        latency_ms=observed["latency_ms"],
-                        function_duration_ms=observed["function_duration_ms"],
-                        stage=stages.get(logical, 0),
-                        status="error",
-                        error_type=observed["error_type"],
-                        error_message=observed["error_message"],
-                        observed_branch=observed.get("observed_branch", ""),
-                    ).to_dict(),
-                )
-                raise
-            latency_ms = observed["latency_ms"]
-            cold = observed["cold_start"]
-            cold_count += int(cold)
-            self._last_environment_ids[logical] = observed["execution_environment_id"]
-            self._hot_until[logical] = monotonic_sec() + float(self.config.get("platform", {}).get("default_retention_sec", 300))
-            event = InvocationEvent(
-                event_type="invocation",
-                run_id=run_id,
-                function_name=function_name,
-                logical_name=logical,
-                invocation_type="real",
-                cold_start=cold,
-                request_id=observed["request_id"],
-                execution_environment_id=observed["execution_environment_id"],
-                latency_ms=latency_ms,
-                function_duration_ms=observed["function_duration_ms"],
-                stage=stages.get(logical, 0),
-                status=observed["status"],
-                error_type=observed["error_type"],
-                error_message=observed["error_message"],
-                observed_branch=observed.get("observed_branch", ""),
-            )
-            append_jsonl(self.events_path, event.to_dict())
-            if logical == "f1" and self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
-                observed_branch = str(observed.get("observed_branch") or "")
-                expected_branch = self._context_branch(context)
-                if observed_branch != expected_branch:
-                    raise InvalidRealObservation(
-                        f"f1 branch observation mismatch: expected={expected_branch!r}, observed={observed_branch!r}"
-                    )
-                if runtime_executor is None:
-                    raise RuntimeError("adaptive runtime executor was not initialized")
-                runtime_pending = self._runtime_revise_after_branch(
-                    run_id, intents, observed_branch, index, runtime_executor
-                )
-                warmup_count += int(runtime_pending is not None)
-
-        if runtime_pending:
-            self._complete_runtime_warmup(run_id, runtime_pending)
-        if runtime_executor:
-            runtime_executor.shutdown(wait=True)
-        if (
-            self.dag.name == "adaptive_branch"
-            and self.baseline == "mint_markov_full"
-            and warmup_count > self._warmup_budget()
-        ):
+        finally:
+            if runtime_executor:
+                runtime_executor.shutdown(wait=True, cancel_futures=True)
+        if self._runtime_replanning_enabled() and warmup_count > self._warmup_budget():
             raise RuntimeError(
                 f"real warmup budget exceeded: executed={warmup_count}, budget={self._warmup_budget()}"
             )
@@ -286,9 +293,9 @@ class MintController:
         return summary_event.to_dict()
 
     def _run_warmups(self, run_id: str, intents: list[WarmupIntent], selected_nodes: list[str], start_sec: float, workflow_index: int = 0) -> int:
-        if self.dag.name == "adaptive_branch":
+        if self._runtime_replanning_enabled():
             intents = [intent for intent in intents if intent.logical_name not in self.dag.entry_nodes]
-        if self.baseline == "path_aware_greedy":
+        if self.baseline in {"path_aware_greedy", "xanadu_like"}:
             actions = self._path_aware_greedy_actions(intents)
         elif self.baseline == "oracle_path":
             actions = self._oracle_path_actions(intents, selected_nodes)
@@ -304,9 +311,11 @@ class MintController:
         }:
             actions = self._static_baseline_actions(intents, workflow_index)
         elif self.baseline == "mint_markov_offline":
-            actions = self._markov_offline_actions(intents)
+            actions = self._markov_joint_actions(intents, self._warmup_budget(), "mint_markov_offline")
         elif self.baseline == "mint_markov_no_runtime_reval":
-            actions = self._markov_no_runtime_reval_actions(intents)
+            actions = self._markov_joint_actions(intents, self._warmup_budget(), "mint_markov_no_runtime_reval")
+        elif self.baseline == "mint_markov_full":
+            actions = self._markov_joint_actions(intents, self._initial_warmup_budget(), "mint_markov_full")
         else:
             call_probability = self._profile_call_probability()
             if self.baseline == "mint_markov_no_long_horizon":
@@ -426,7 +435,8 @@ class MintController:
         observed_branch: str,
         workflow_index: int,
         executor: ThreadPoolExecutor,
-    ) -> tuple[Future[dict[str, Any]], WarmupIntent, float] | None:
+        completed_nodes: set[str],
+    ) -> tuple[Future[dict[str, Any]], WarmupIntent, float, float] | None:
         if observed_branch not in self.dag.nodes:
             raise ValueError(f"observed branch is not a DAG node: {observed_branch}")
         actual_targets = self.dag.reachable_from([observed_branch])
@@ -460,7 +470,7 @@ class MintController:
                     intent_id=intent.intent_id,
                     function_name=intent.function_name,
                     logical_name=node,
-                    action="cancel",
+                    action="invalidate_executed",
                     action_reason="runtime_invalidated_after_f1_already_executed_wasted",
                     gain=0.0,
                     planned_time_sec=intent.planned_time_sec,
@@ -494,7 +504,7 @@ class MintController:
         runtime_state = MarkovState(
             frontier=(observed_branch,),
             hot_ttl=tuple(sorted((node, retention) for node in executed)),
-            completed=tuple(sorted(set(self.dag.entry_nodes))),
+            completed=tuple(sorted(completed_nodes)),
             branch_path=observed_branch,
             time_bucket=1,
         )
@@ -527,7 +537,7 @@ class MintController:
                 intent_id=intent.intent_id,
                 function_name=intent.function_name,
                 logical_name=target,
-                action="replace",
+                action="replacement_warmup",
                 action_reason="runtime_branch_observation_parallel_successor_warmup",
                 gain=runtime_gain,
                 planned_time_sec=intent.planned_time_sec,
@@ -539,7 +549,7 @@ class MintController:
         )
         started = monotonic_sec()
         future = executor.submit(self._invoke_runtime_warmup, run_id, intent, workflow_index)
-        return future, intent, started
+        return future, intent, started, runtime_gain
 
     def _invoke_runtime_warmup(self, run_id: str, intent: WarmupIntent, workflow_index: int) -> dict[str, Any]:
         payload = {"function_name": intent.logical_name, "run_id": run_id, "invocation_type": "warmup", "sleep_ms": 1}
@@ -561,11 +571,35 @@ class MintController:
     def _complete_runtime_warmup(
         self,
         run_id: str,
-        pending: tuple[Future[dict[str, Any]], WarmupIntent, float],
+        pending: tuple[Future[dict[str, Any]], WarmupIntent, float, float],
     ) -> None:
-        future, intent, overlap_started_sec = pending
+        future, intent, overlap_started_sec, runtime_gain = pending
         wait_started_sec = monotonic_sec()
-        observed = future.result()
+        try:
+            observed = future.result()
+        except Exception as exc:
+            observed = self._failed_observation({}, exc)
+            append_jsonl(
+                self.events_path,
+                WarmupEvent(
+                    event_type="warmup",
+                    run_id=run_id,
+                    function_name=intent.function_name,
+                    logical_name=intent.logical_name,
+                    intent_id=intent.intent_id,
+                    action="replacement_warmup",
+                    useful=False,
+                    action_reason="runtime_replacement_failed",
+                    gain=runtime_gain,
+                    invocation_type="warmup",
+                    status="error",
+                    error_type=observed["error_type"],
+                    error_message=observed["error_message"],
+                    overlap_duration_ms=round((monotonic_sec() - overlap_started_sec) * 1000.0, 3),
+                    blocking_wait_ms=round((monotonic_sec() - wait_started_sec) * 1000.0, 3),
+                ).to_dict(),
+            )
+            raise
         wait_ms = round((monotonic_sec() - wait_started_sec) * 1000.0, 3)
         self._last_environment_ids[intent.logical_name] = observed["execution_environment_id"]
         self._hot_until[intent.logical_name] = monotonic_sec() + float(
@@ -581,10 +615,10 @@ class MintController:
                 function_name=intent.function_name,
                 logical_name=intent.logical_name,
                 intent_id=intent.intent_id,
-                action="replace",
+                action="replacement_warmup",
                 useful=True,
                 action_reason="runtime_branch_observation_parallel_successor_warmup",
-                gain=intent.offline_gain,
+                gain=runtime_gain,
                 invocation_type="warmup",
                 cold_start=observed["cold_start"],
                 request_id=observed["request_id"],
@@ -601,10 +635,23 @@ class MintController:
 
     def _initial_warmup_budget(self) -> int:
         total = self._warmup_budget()
-        if self.dag.name == "adaptive_branch" and self.baseline == "mint_markov_full":
+        if self._runtime_replanning_enabled():
             configured = int(self.config.get("experiment", {}).get("adaptive_initial_warmup_budget", 1))
             return max(0, min(total, configured))
         return total
+
+    def _runtime_replanning_enabled(self) -> bool:
+        return self.baseline == "mint_markov_full" and bool(self.dag.branch_rules)
+
+    def _revealed_successor(self, logical_name: str, context: dict[str, Any]) -> str:
+        if logical_name not in self.dag.branch_rules:
+            return ""
+        successors = self.dag.next_nodes(logical_name, context)
+        if len(successors) != 1:
+            raise ValueError(
+                f"dynamic branch {logical_name!r} must reveal exactly one successor; got {successors!r}"
+            )
+        return successors[0]
 
     def _planner_type_for_baseline(self) -> str:
         if self.baseline in {"mint_markov_offline", "mint_markov_no_runtime_reval", "mint_markov_no_long_horizon", "mint_markov_full"}:
@@ -617,6 +664,8 @@ class MintController:
             return "orion_like"
         if self.baseline == "path_aware_greedy":
             return "runtime_greedy"
+        if self.baseline == "xanadu_like":
+            return "xanadu_like"
         if self.baseline == "oracle_path":
             return "oracle"
         return self.config.get("planner", {}).get("type", "heuristic")
@@ -749,6 +798,7 @@ class MintController:
         return False
 
     def _path_aware_greedy_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        label = "xanadu_like" if self.baseline == "xanadu_like" else "path_aware"
         call_probability = self._profile_call_probability()
         now = monotonic_sec()
         budget = self._warmup_budget()
@@ -758,18 +808,18 @@ class MintController:
             p_call = float(call_probability.get(intent.logical_name, 0.0))
             expected_gain = self._path_aware_expected_gain(intent, p_call)
             if p_call <= 0.0:
-                actions.append(WarmupAction("cancel", intent, expected_gain, "path_aware_not_profile_reachable"))
+                actions.append(WarmupAction("cancel_pending", intent, expected_gain, f"{label}_not_profile_reachable"))
             elif self._hot_until.get(intent.logical_name, 0.0) > now:
-                actions.append(WarmupAction("cancel", intent, expected_gain, "path_aware_already_hot"))
+                actions.append(WarmupAction("cancel_pending", intent, expected_gain, f"{label}_already_hot"))
             else:
                 candidates.append((intent, expected_gain))
 
         ranked = sorted(candidates, key=lambda item: (-item[1], item[0].stage, item[0].planned_time_sec, item[0].logical_name))
         for index, (intent, expected_gain) in enumerate(ranked):
             if index < budget:
-                actions.append(WarmupAction("execute", intent, expected_gain, "path_aware_profile_expected_gain_within_budget"))
+                actions.append(WarmupAction("execute", intent, expected_gain, f"{label}_profile_expected_gain_within_budget"))
             else:
-                actions.append(WarmupAction("replace", intent, expected_gain, "path_aware_greedy_budget_exceeded"))
+                actions.append(WarmupAction("cancel_pending", intent, expected_gain, f"{label}_budget_exceeded"))
         return actions
 
     def _path_aware_expected_gain(self, intent: WarmupIntent, p_call: float) -> float:
@@ -787,9 +837,9 @@ class MintController:
         candidates: list[WarmupIntent] = []
         for intent in intents:
             if intent.logical_name not in selected:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "oracle_not_on_real_path"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "oracle_not_on_real_path"))
             elif self._hot_until.get(intent.logical_name, 0.0) > now:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "oracle_already_hot"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "oracle_already_hot"))
             else:
                 candidates.append(intent)
 
@@ -798,7 +848,7 @@ class MintController:
             if index < budget:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, "oracle_path_upper_bound"))
             else:
-                actions.append(WarmupAction("replace", intent, intent.offline_gain, "oracle_budget_exceeded"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "oracle_budget_exceeded"))
         return actions
 
     def _markov_offline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
@@ -809,7 +859,31 @@ class MintController:
             if index < budget:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, "mint_markov_offline_top_intent_within_budget"))
             else:
-                actions.append(WarmupAction("replace", intent, intent.offline_gain, "mint_markov_offline_budget_exceeded"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "mint_markov_offline_budget_exceeded"))
+        return actions
+
+    def _markov_joint_actions(
+        self,
+        intents: list[WarmupIntent],
+        budget: int,
+        label: str,
+    ) -> list[WarmupAction]:
+        """Select the analyzer's joint action, not the top-B singleton gains."""
+        from mint.markov_policy import MarkovAction, MarkovPolicyAnalyzer
+
+        analyzer = MarkovPolicyAnalyzer(self.dag, self._planner_config(), budget=budget)
+        initial = analyzer.transition_model.initial_state()
+        policy = analyzer.analyze(initial)
+        selected = set(policy.get(initial, MarkovAction(tuple())).warmup_functions)
+        now = monotonic_sec()
+        actions: list[WarmupAction] = []
+        for intent in intents:
+            gain = analyzer.marginal_gain(initial, intent.logical_name)
+            if intent.logical_name in selected and self._hot_until.get(intent.logical_name, 0.0) <= now:
+                actions.append(WarmupAction("execute", intent, gain, f"{label}_joint_q_action"))
+            else:
+                reason = f"{label}_already_hot" if intent.logical_name in selected else f"{label}_not_in_joint_q_action"
+                actions.append(WarmupAction("cancel_pending", intent, gain, reason))
         return actions
 
     def _markov_no_runtime_reval_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
@@ -820,12 +894,12 @@ class MintController:
         actions: list[WarmupAction] = []
         for intent in ranked:
             if self._hot_until.get(intent.logical_name, 0.0) > now:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "mint_markov_no_runtime_reval_already_hot"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "mint_markov_no_runtime_reval_already_hot"))
             elif executed < budget:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, "mint_markov_no_runtime_reval_offline_rank_within_budget"))
                 executed += 1
             else:
-                actions.append(WarmupAction("cancel", intent, intent.offline_gain, "mint_markov_no_runtime_reval_budget_exceeded"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "mint_markov_no_runtime_reval_budget_exceeded"))
         return actions
 
     def _static_baseline_actions(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupAction]:
@@ -842,7 +916,7 @@ class MintController:
             if index < budget:
                 actions.append(WarmupAction("execute", intent, intent.offline_gain, f"{self.baseline}_within_budget"))
             else:
-                actions.append(WarmupAction("replace", intent, intent.offline_gain, f"{self.baseline}_budget_exceeded"))
+                actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, f"{self.baseline}_budget_exceeded"))
         return actions
 
     def _periodic_keepwarm_ranked_intents(self, intents: list[WarmupIntent], workflow_index: int = 0) -> list[WarmupIntent]:

@@ -3,7 +3,7 @@ from mint.scheduler import schedule_intents
 from mint.workloads import get_workload
 
 
-def test_scheduler_can_produce_execute_delay_cancel_replace():
+def test_scheduler_can_produce_execute_delay_and_cancel_pending():
     config = {
         "experiment": {"warmup_budget": 1},
         "platform": {"default_retention_sec": 300, "default_warm_duration_ms": 100},
@@ -19,8 +19,7 @@ def test_scheduler_can_produce_execute_delay_cancel_replace():
     actions = schedule_intents(intents, runtime_state, 1, config)
     action_types = {action.action_type for action in actions}
     assert "execute" in action_types
-    assert "replace" in action_types
-    assert "cancel" in action_types
+    assert "cancel_pending" in action_types
     assert sum(1 for action in actions if action.action_type == "execute") == 1
 
     delayed = schedule_intents(intents, {"now_sec": -999.0, "call_probability": {}, "hot_until": {}}, 10, config)

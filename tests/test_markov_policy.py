@@ -144,3 +144,14 @@ def test_generic_reachability_does_not_depend_on_function_names():
         terminal_nodes=["later", "other"],
     )
     assert dag.reachable_from(["chosen"]) == {"chosen", "later"}
+
+
+def test_budget_two_policy_minimizes_over_joint_q_actions():
+    analyzer = MarkovPolicyAnalyzer(get_workload("greedy_trap"), _config(budget=2), budget=2)
+    initial = analyzer.transition_model.initial_state()
+    action = analyzer.analyze(initial)[initial]
+    assert len(action.warmup_functions) == 2
+    joint_actions = [candidate for candidate in analyzer.enumerate_actions(initial) if len(candidate.warmup_functions) == 2]
+    assert analyzer.q_costs[(initial, action)] == min(
+        analyzer.q_costs[(initial, candidate)] for candidate in joint_actions
+    )

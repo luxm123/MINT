@@ -147,7 +147,7 @@ def test_ablation_baselines_generate_matrix_events_and_figures(tmp_path):
         "oracle_path",
     }
     assert (output_root / "failed_runs.jsonl").read_text(encoding="utf-8") == ""
-    assert all(rows["execute_count"] >= rows["total_warmup"])
+    assert all(rows["execute_count"] + rows["replacement_warmup_count"] >= rows["total_warmup"])
     assert all(rows["replace_count"] >= 0)
     for output_dir in rows["output_dir"]:
         assert (output_root / "summary_matrix.csv").exists()

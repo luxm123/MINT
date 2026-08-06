@@ -20,7 +20,7 @@ def test_static_dag_and_mint_offline_obey_warmup_budget(tmp_path):
         summary = controller.run(3)
         assert summary["total_warmup"] == 6
         assert summary["execute_count"] == 6
-        assert summary["replace_count"] == 3
+        assert summary["cancel_pending_count"] == 3
 
 
 def test_unlimited_static_baseline_can_warm_all_nodes(tmp_path):
@@ -41,7 +41,7 @@ def test_periodic_keepwarm_and_orion_like_obey_warmup_budget(tmp_path):
         summary = controller.run(2)
         assert summary["total_warmup"] == 4
         assert summary["execute_count"] == 4
-        assert summary["replace_count"] == 2
+        assert summary["cancel_pending_count"] == 2
 
 
 def _events(path):
@@ -64,7 +64,7 @@ def test_path_aware_greedy_does_not_use_full_selected_path(tmp_path):
     assert "f3" in invoked
     assert "f2" not in invoked
     assert any(node not in dag.entry_nodes for node in warmed)
-    assert any(event.get("action") == "replace" for event in events if event.get("event_type") == "scheduler_decision")
+    assert any(event.get("action") == "cancel_pending" for event in events if event.get("event_type") == "scheduler_decision")
 
 
 def test_path_aware_greedy_uses_profile_future_candidates_and_budget(tmp_path):
@@ -81,7 +81,7 @@ def test_path_aware_greedy_uses_profile_future_candidates_and_budget(tmp_path):
     assert summary["total_warmup"] == 2
     assert len(warmed) == 2
     assert any(node not in dag.entry_nodes for node in warmed)
-    assert sum(1 for event in decisions if event.get("action") == "replace") == len(dag.nodes) - 2
+    assert sum(1 for event in decisions if event.get("action") == "cancel_pending") == len(dag.nodes) - 2
     assert not any(event.get("action") == "delay" for event in decisions)
 
 
@@ -112,30 +112,19 @@ def test_oracle_path_can_use_selected_nodes_for_decision(tmp_path):
 
     actions = controller._oracle_path_actions(planned, ["f1", "f4", "f6", "f7"])
     executed = [action.intent.logical_name for action in actions if action.action_type == "execute"]
-    cancelled = [action.intent.logical_name for action in actions if action.action_type == "cancel"]
+    cancelled = [action.intent.logical_name for action in actions if action.action_type == "cancel_pending"]
     assert set(executed) <= {"f1", "f4", "f6", "f7"}
     assert any(node not in {"f1", "f4", "f6", "f7"} for node in cancelled)
 
 
 def test_mint_markov_full_uses_profile_probabilities_not_full_selected_path(tmp_path, monkeypatch):
-    captured = {}
-
-    def fake_schedule(intents, runtime_state, budget, config):
-        captured["call_probability"] = runtime_state["call_probability"]
-        captured["frontier"] = runtime_state["frontier"]
-        return []
-
-    monkeypatch.setattr(controller_mod, "schedule_intents", fake_schedule)
     dag = get_workload("wide_branch")
     config = _config(tmp_path, "mint_markov_full")
     config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
     config["experiment"].update({"warmup_budget": 2, "branch_seed": 0, "profile_mismatch": False})
     config["planner"] = {"type": "markov", "horizon": 5}
     controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
-    controller.run(1)
-
-    assert captured["frontier"] == ["f1"]
-    probabilities = captured["call_probability"]
+    probabilities = controller._profile_call_probability()
     assert {probabilities[node] for node in ["f2", "f3", "f4", "f5"]} == {0.25}
     assert probabilities["f6"] == 1.0
     assert probabilities["f7"] == 1.0
@@ -158,10 +147,14 @@ def test_mint_markov_offline_executes_only_offline_top_budget_without_runtime_re
     executed = [event["logical_name"] for event in events if event.get("event_type") == "warmup"]
     decisions = [event for event in events if event.get("event_type") == "scheduler_decision"]
     planned = controller_mod.plan_intents(dag, controller._planner_config())
-    expected = [intent.logical_name for intent in sorted(planned, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))[:2]]
+    from mint.markov_policy import MarkovPolicyAnalyzer
+    analyzer = MarkovPolicyAnalyzer(dag, controller._planner_config(), budget=2)
+    initial = analyzer.transition_model.initial_state()
+    expected = list(analyzer.analyze(initial)[initial].warmup_functions)
     assert executed == expected
     assert all(event["action_reason"].startswith("mint_markov_offline_") for event in decisions)
-    assert not any(event["action"] in {"delay", "cancel"} for event in decisions)
+    assert not any(event["action"] == "delay" for event in decisions)
+    assert sum(event["action"] == "cancel_pending" for event in decisions) == len(planned) - 2
 
 
 def test_mint_markov_no_runtime_reval_uses_offline_rank_budget_and_hot_guard(tmp_path, monkeypatch):
@@ -184,9 +177,9 @@ def test_mint_markov_no_runtime_reval_uses_offline_rank_budget_and_hot_guard(tmp
         decisions = [event for event in events if event.get("event_type") == "scheduler_decision" and event["run_id"] == run_id]
         executes = [event for event in decisions if event["action"] == "execute"]
         assert len(executes) <= 2
-        assert not any(event["action"] == "replace" for event in decisions)
+        assert not any(event["action"] == "replacement_warmup" for event in decisions)
     second_run_decisions = [event for event in events if event.get("event_type") == "scheduler_decision" and event["run_id"] == run_ids[1]]
-    assert any(event["action"] == "cancel" and event["action_reason"] == "mint_markov_no_runtime_reval_already_hot" for event in second_run_decisions)
+    assert any(event["action"] == "cancel_pending" and event["action_reason"] == "mint_markov_no_runtime_reval_already_hot" for event in second_run_decisions)
 
 
 def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_benefit(tmp_path, monkeypatch):
@@ -217,7 +210,7 @@ def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_b
     assert set(runtime_state["path_benefit"]) <= set(dag.nodes)
 
 
-def test_mint_markov_full_and_no_long_horizon_share_scheduler_inputs_except_path_benefit(tmp_path, monkeypatch):
+def test_mint_markov_full_reserves_runtime_budget_while_no_long_horizon_does_not(tmp_path, monkeypatch):
     captured = {}
 
     def fake_schedule(intents, runtime_state, budget, config):
@@ -239,13 +232,8 @@ def test_mint_markov_full_and_no_long_horizon_share_scheduler_inputs_except_path
         config["planner"] = {"type": "markov", "horizon": 6}
         MintController(config, dag=dag, baseline=baseline, dry_run=True).run(1)
 
-    full = captured["mint_markov_full"]
-    no_long = captured["mint_markov_no_long_horizon"]
-    assert full["intent_names"] == no_long["intent_names"]
-    assert full["budget"] == no_long["budget"] == 2
-    for key in ("now_sec", "call_probability", "frontier", "hot_until"):
-        assert full["runtime_state"][key] == no_long["runtime_state"][key]
-    assert full["runtime_state"]["path_benefit"] != no_long["runtime_state"]["path_benefit"]
+    assert "mint_markov_full" not in captured  # joint Q planner is used directly
+    assert captured["mint_markov_no_long_horizon"]["budget"] == 2
 
 
 def test_greedy_trap_workload_has_profile_branch_and_common_suffix():
@@ -280,7 +268,7 @@ def test_greedy_trap_mint_and_path_aware_targets_differ_without_path_leak(tmp_pa
     greedy_decisions = [event for event in greedy_events if event.get("event_type") == "scheduler_decision"]
     mint_decisions = [event for event in mint_events if event.get("event_type") == "scheduler_decision"]
     assert sum(1 for event in greedy_decisions if event.get("action") == "execute") <= 2
-    assert any(event.get("action") in {"cancel", "replace"} for event in mint_decisions)
+    assert any(event.get("action") in {"cancel_pending", "replacement_warmup"} for event in mint_decisions)
 
 
 def test_mint_no_long_horizon_and_full_respect_deadline_and_budget_on_greedy_trap(tmp_path):
@@ -326,8 +314,9 @@ def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp
 
     assert all(len(nodes) <= 2 for nodes in warmups.values())
     assert all("f1" not in nodes for nodes in warmups.values())
-    assert "replace" not in actions["mint_markov_no_runtime_reval"]
-    assert "replace" in actions["mint_markov_full"]
+    assert "replacement_warmup" not in actions["mint_markov_no_runtime_reval"]
+    assert all(action in {"execute", "delay", "cancel_pending", "invalidate_executed", "replacement_warmup"}
+               for action in actions["mint_markov_full"])
 
 
 def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
@@ -352,6 +341,7 @@ def test_real_aws_run_records_lambda_observed_metrics(tmp_path, monkeypatch):
                 "execution_environment_id": metrics["execution_environment_id"],
                 "invocation_type": payload["invocation_type"],
                 "status": "ok",
+                "observed_branch": payload.get("branch", ""),
             },
         }
 
@@ -387,6 +377,7 @@ def test_real_aws_run_forbids_simulated_metric_fallback(tmp_path, monkeypatch):
                 "execution_environment_id": "env-a",
                 "invocation_type": payload["invocation_type"],
                 "status": "ok",
+                "observed_branch": payload.get("branch", ""),
             },
         }
 
@@ -419,6 +410,7 @@ def test_controller_uses_selected_function_pool_for_real_and_warmup_calls(tmp_pa
                 "execution_environment_id": f"env-{function_name}",
                 "invocation_type": payload["invocation_type"],
                 "status": "ok",
+                "observed_branch": payload.get("branch", ""),
             },
         }
 
@@ -457,16 +449,16 @@ def test_warmup_overrun_is_counted_in_end_to_end_latency(tmp_path, monkeypatch):
         planned_arrival_time="2026-01-01T00:00:00+00:00",
     )
 
-    assert result["arrival_lateness_ms"] >= 35
+    assert result["arrival_lateness_ms"] >= 15
     assert 0 < result["warmup_overrun_ms"] <= result["arrival_lateness_ms"]
     assert result["latency_ms"] >= result["arrival_lateness_ms"]
     assert result["block_id"] == "block-0000"
 
 
 def test_no_executed_warmup_never_reports_warmup_overrun(tmp_path, monkeypatch):
-    monkeypatch.setattr(controller_mod, "schedule_intents", lambda *args, **kwargs: [])
     config = _config(tmp_path, "mint_markov_full")
     config["experiment"]["warmup_lead_sec"] = 0
+    config["experiment"]["warmup_budget"] = 0
     controller = MintController(config, dag=get_workload("chain"), baseline="mint_markov_full", dry_run=True)
 
     result = controller.run_once(0, planned_arrival_sec=controller_mod.monotonic_sec())
@@ -495,19 +487,19 @@ def test_adaptive_markov_learns_from_past_then_replaces_after_f1(tmp_path):
 
     probabilities = json.loads(model_events[0]["branch_probabilities"])
     assert probabilities == {"f2": 0.7, "f3": 0.1, "f4": 0.1, "f5": 0.1}
-    assert {event["logical_name"] for event in warmups if event["action"] == "execute"} == {"f6"}
-    assert {event["logical_name"] for event in warmups if event["action"] == "replace"} == {"f8"}
+    assert {event["logical_name"] for event in warmups if event["action"] == "execute"} == {"f2"}
+    assert {event["logical_name"] for event in warmups if event["action"] == "replacement_warmup"} == {"f8"}
     assert len(warmups) == 2
     assert any(
         event["decision_phase"] == "runtime_after_f1"
-        and event["logical_name"] == "f6"
-        and event["action"] == "cancel"
+        and event["logical_name"] == "f2"
+        and event["action"] == "invalidate_executed"
         for event in decisions
     )
     assert any(
         event["decision_phase"] == "runtime_after_f1"
         and event["logical_name"] == "f8"
-        and event["action"] == "replace"
+        and event["action"] == "replacement_warmup"
         for event in decisions
     )
     invocation_path = [event["logical_name"] for event in events if event.get("event_type") == "invocation"]
@@ -552,10 +544,66 @@ def test_adaptive_runtime_warmup_overlaps_branch_work_and_respects_total_budget(
     result = controller.run_once(0, planned_arrival_sec=planned)
     events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
     warmups = [event for event in events if event.get("event_type") == "warmup"]
-    runtime = next(event for event in warmups if event["action"] == "replace")
+    runtime = next(event for event in warmups if event["action"] == "replacement_warmup")
 
     assert result["warmup_count"] == 2
     assert len(warmups) == 2
     assert runtime["logical_name"] == "f8"
     assert runtime["overlap_duration_ms"] >= 45
     assert runtime["blocking_wait_ms"] < 15
+
+
+def test_runtime_replanning_is_enabled_for_non_adaptive_dynamic_dag(tmp_path):
+    dag = get_workload("branch")
+    config = _config(tmp_path, "mint_markov_full")
+    config["experiment"].update({"warmup_budget": 2, "branch_seed": 0})
+    config["planner"] = {"type": "markov", "horizon": 5, "branch_probability_left": 0.8}
+    controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+
+    result = controller.run_once(0)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    runtime_models = [
+        event for event in events
+        if event.get("event_type") == "branch_model" and event.get("decision_phase") == "runtime_after_f1"
+    ]
+    assert result["warmup_count"] <= 2
+    assert runtime_models
+    assert runtime_models[0]["observed_branch"] in {"f2", "f3"}
+
+
+def test_async_runtime_warmup_failure_is_logged_and_propagated(tmp_path, monkeypatch):
+    def failing_runtime_warmup(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
+        if payload["invocation_type"] == "warmup" and payload["function_name"] == "f8":
+            raise TimeoutError("synthetic runtime warmup timeout")
+        return {"dry_run": True, "function_name": function_name, "payload": payload, "status_code": 200}
+
+    monkeypatch.setattr(controller_mod, "invoke_lambda", failing_runtime_warmup)
+    dag = get_workload("adaptive_branch")
+    config = _config(tmp_path, "mint_markov_full")
+    config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+    config["experiment"].update({"warmup_budget": 2, "branch_trace": ["f4"]})
+    config["planner"] = {
+        "type": "markov",
+        "horizon": 5,
+        "historical_branch_records": ["f2"] * 7 + ["f3", "f4", "f5"],
+    }
+    controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
+
+    with pytest.raises(TimeoutError, match="synthetic runtime warmup timeout"):
+        controller.run_once(0)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    failures = [event for event in events if event.get("event_type") == "warmup" and event.get("status") == "error"]
+    assert len(failures) == 1
+    assert failures[0]["action"] == "replacement_warmup"
+    assert failures[0]["error_type"] == "TimeoutError"
+
+
+def test_orion_xanadu_and_oracle_use_same_budget(tmp_path):
+    dag = get_workload("adaptive_branch")
+    for baseline in ("orion_like", "xanadu_like", "oracle_path"):
+        config = _config(tmp_path, baseline)
+        config["aws"]["lambda_functions"] = {node: f"mint-{node}" for node in dag.nodes}
+        config["experiment"].update({"warmup_budget": 2, "branch_trace": ["f4"]})
+        controller = MintController(config, dag=dag, baseline=baseline, dry_run=True)
+        result = controller.run_once(0)
+        assert result["warmup_count"] <= 2

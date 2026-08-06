@@ -58,6 +58,10 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
         "useful_warmup_ratio": round(useful_warmup / total_warmup, 6) if total_warmup else 0.0,
         "execute_count": action_counts.get("execute", 0),
         "delay_count": action_counts.get("delay", 0),
-        "cancel_count": action_counts.get("cancel", 0),
-        "replace_count": action_counts.get("replace", 0),
+        "cancel_pending_count": action_counts.get("cancel_pending", 0),
+        "invalidate_executed_count": action_counts.get("invalidate_executed", 0),
+        "replacement_warmup_count": action_counts.get("replacement_warmup", 0),
+        # Compatibility aliases for old result-table readers.
+        "cancel_count": action_counts.get("cancel_pending", 0) + action_counts.get("cancel", 0),
+        "replace_count": action_counts.get("replacement_warmup", 0) + action_counts.get("replace", 0),
     }

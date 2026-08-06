@@ -17,6 +17,9 @@ experiment:
   repetitions: 20
   warmup_budget: 2
   dry_run: true
+  # Decision-audit pilot: prevent controller heat from suppressing later
+  # prediction/replanning events. This is not an AWS cold-start mechanism.
+  reset_runtime_state_each_run: true
   output_dir: results/adaptive_local_pilot
   branch_seed: 20260804
   branch_probability_phases:
