@@ -117,6 +117,7 @@ class MintController:
         planned_arrival_sec: float | None = None,
         planned_arrival_time: str = "",
     ) -> dict[str, Any]:
+        self._workflow_index = index
         run_id = new_id("run")
         self._active_model_snapshot = self._branch_history.snapshot() if self._branch_history else {}
         planner_config = self._planner_config()
@@ -129,6 +130,7 @@ class MintController:
                 BranchModelEvent(
                     event_type="branch_model",
                     run_id=run_id,
+                    workflow_index=index,
                     decision_phase="initial",
                     history_size=int(self._active_model_snapshot["history_size"]),
                     branch_counts=json.dumps(self._active_model_snapshot["counts"], sort_keys=True),
@@ -198,6 +200,7 @@ class MintController:
                         InvocationEvent(
                             event_type="invocation",
                             run_id=run_id,
+                            workflow_index=index,
                             function_name=function_name,
                             logical_name=logical,
                             invocation_type="real",
@@ -222,6 +225,7 @@ class MintController:
                 event = InvocationEvent(
                     event_type="invocation",
                     run_id=run_id,
+                    workflow_index=index,
                     function_name=function_name,
                     logical_name=logical,
                     invocation_type="real",
@@ -249,6 +253,7 @@ class MintController:
                     runtime_pending = self._runtime_revise_after_branch(
                         run_id, intents, observed_branch, index, runtime_executor,
                         completed_nodes=set(selected_nodes[: path_index + 1]),
+                        decision_node=logical,
                     )
                     warmup_count += int(runtime_pending is not None)
 
@@ -268,6 +273,7 @@ class MintController:
         summary_event = WorkflowRunSummary(
             event_type="workflow_summary",
             run_id=run_id,
+            workflow_index=index,
             dag=self.dag.name,
             baseline=self.baseline,
             planner_type=self.planner_type,
@@ -342,6 +348,7 @@ class MintController:
             decision = SchedulerDecision(
                 event_type="scheduler_decision",
                 run_id=run_id,
+                workflow_index=workflow_index,
                 intent_id=intent.intent_id,
                 function_name=intent.function_name,
                 logical_name=intent.logical_name,
@@ -379,6 +386,7 @@ class MintController:
                     WarmupEvent(
                         event_type="warmup",
                         run_id=run_id,
+                        workflow_index=workflow_index,
                         function_name=intent.function_name,
                         logical_name=intent.logical_name,
                         intent_id=intent.intent_id,
@@ -406,6 +414,7 @@ class MintController:
             warmup_event = WarmupEvent(
                 event_type="warmup",
                 run_id=run_id,
+                workflow_index=workflow_index,
                 function_name=intent.function_name,
                 logical_name=intent.logical_name,
                 intent_id=intent.intent_id,
@@ -436,6 +445,7 @@ class MintController:
         workflow_index: int,
         executor: ThreadPoolExecutor,
         completed_nodes: set[str],
+        decision_node: str,
     ) -> tuple[Future[dict[str, Any]], WarmupIntent, float, float] | None:
         if observed_branch not in self.dag.nodes:
             raise ValueError(f"observed branch is not a DAG node: {observed_branch}")
@@ -449,11 +459,13 @@ class MintController:
             BranchModelEvent(
                 event_type="branch_model",
                 run_id=run_id,
-                decision_phase="runtime_after_f1",
+                workflow_index=workflow_index,
+                decision_phase="runtime_after_branch",
                 history_size=int(self._active_model_snapshot.get("history_size", 0)),
                 branch_counts=json.dumps(self._active_model_snapshot.get("counts", {}), sort_keys=True),
                 branch_probabilities=probabilities,
                 observed_branch=observed_branch,
+                decision_node=decision_node,
             ).to_dict(),
         )
         for node in executed:
@@ -467,6 +479,7 @@ class MintController:
                 SchedulerDecision(
                     event_type="scheduler_decision",
                     run_id=run_id,
+                    workflow_index=workflow_index,
                     intent_id=intent.intent_id,
                     function_name=intent.function_name,
                     logical_name=node,
@@ -474,9 +487,10 @@ class MintController:
                     action_reason="runtime_invalidated_after_f1_already_executed_wasted",
                     gain=0.0,
                     planned_time_sec=intent.planned_time_sec,
-                    decision_phase="runtime_after_f1",
+                    decision_phase="runtime_after_branch",
                     model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
                     branch_probabilities=probabilities,
+                    decision_node=decision_node,
                 ).to_dict(),
             )
 
@@ -534,6 +548,7 @@ class MintController:
             SchedulerDecision(
                 event_type="scheduler_decision",
                 run_id=run_id,
+                workflow_index=workflow_index,
                 intent_id=intent.intent_id,
                 function_name=intent.function_name,
                 logical_name=target,
@@ -541,10 +556,11 @@ class MintController:
                 action_reason="runtime_branch_observation_parallel_successor_warmup",
                 gain=runtime_gain,
                 planned_time_sec=intent.planned_time_sec,
-                decision_phase="runtime_after_f1",
+                decision_phase="runtime_after_branch",
                 model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
                 branch_probabilities=probabilities,
                 supersedes_intent_id=intent_by_node[replaced].intent_id if replaced else "",
+                decision_node=decision_node,
             ).to_dict(),
         )
         started = monotonic_sec()
@@ -584,6 +600,7 @@ class MintController:
                 WarmupEvent(
                     event_type="warmup",
                     run_id=run_id,
+                    workflow_index=self._workflow_index,
                     function_name=intent.function_name,
                     logical_name=intent.logical_name,
                     intent_id=intent.intent_id,
@@ -612,6 +629,7 @@ class MintController:
             WarmupEvent(
                 event_type="warmup",
                 run_id=run_id,
+                workflow_index=self._workflow_index,
                 function_name=intent.function_name,
                 logical_name=intent.logical_name,
                 intent_id=intent.intent_id,
@@ -1098,6 +1116,7 @@ class MintController:
                 fh,
                 fieldnames=[
                     "run_id",
+                    "workflow_index",
                     "dag",
                     "baseline",
                     "planner_type",

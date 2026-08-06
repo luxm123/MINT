@@ -46,7 +46,7 @@ def test_no_warmup_cold_starts_are_uncovered_not_missed(tmp_path):
 def test_cold_start_with_unserved_intent_counts_separately(tmp_path):
     events_path = tmp_path / "events.jsonl"
     events = [
-        {"event_type": "scheduler_decision", "run_id": "r1", "logical_name": "f1", "action": "replace"},
+        {"event_type": "scheduler_decision", "run_id": "r1", "logical_name": "f1", "action": "replacement_warmup"},
         {"event_type": "invocation", "run_id": "r1", "logical_name": "f1", "cold_start": True, "latency_ms": 900},
         {"event_type": "workflow_summary", "run_id": "r1", "latency_ms": 900},
     ]

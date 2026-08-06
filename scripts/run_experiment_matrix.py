@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import itertools
 import json
 import random
@@ -18,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mint.controller import MintController
+from mint.branch_history import read_branch_records
 from mint.utils import append_jsonl, ensure_dir, load_yaml
 from mint.workloads import get_workload
 
@@ -69,8 +71,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooldown-sec", type=float, default=0.0)
     parser.add_argument("--profile-mismatch", action="store_true", help="Enable controlled branch-profile mismatch for adaptive stress DAGs.")
     parser.add_argument("--timing-jitter-ms", type=float, default=0.0, help="Controlled per-stage timing jitter for adaptive stress DAGs.")
-    parser.add_argument("--branch-seed", type=int, default=0, help="Deterministic branch sequence seed for adaptive stress DAGs.")
+    parser.add_argument("--branch-seed", type=int, default=None, help="Override the config's deterministic branch seed.")
     parser.add_argument("--randomize-order", action="store_true")
+    parser.add_argument("--order-seed", type=int, default=0, help="Seed used only to randomize matrix configuration order.")
     parser.add_argument("--dry-run", action="store_true", help="Never call AWS; enabled by default unless --confirm-real-run is used.")
     parser.add_argument("--confirm-real-run", action="store_true", help="Required to allow real AWS Lambda invocation.")
     parser.add_argument("--output-root", default="results/matrix")
@@ -93,6 +96,7 @@ def effective_planner_for_baseline(baseline: str) -> str:
         "static_dag_unlimited": "static",
         "orion_like": "orion_like",
         "path_aware_greedy": "runtime_greedy",
+        "xanadu_like": "xanadu_like",
         "oracle_path": "oracle",
         "mint_offline": "heuristic",
         "mint_offline_unlimited": "heuristic",
@@ -121,6 +125,38 @@ def _write_matrix_outputs(output_root: Path, rows: list[dict[str, Any]], manifes
         json.dump(manifest, fh, indent=2, sort_keys=True)
 
 
+def _materialize_initial_history(base_config: dict[str, Any]) -> list[str]:
+    planner = base_config.setdefault("planner", {})
+    records = list(planner.get("historical_branch_records", []))
+    history_path = planner.pop("branch_history_path", None)
+    if history_path:
+        records.extend(read_branch_records(Path(history_path)))
+    planner["historical_branch_records"] = records
+    return records
+
+
+def _adaptive_branch_trace(config: dict[str, Any], repetitions: int, seed: int) -> list[str]:
+    experiment = config.get("experiment", {})
+    configured = list(experiment.get("branch_trace", []))
+    if configured:
+        return [str(configured[index % len(configured)]) for index in range(repetitions)]
+    branches = ("f2", "f3", "f4", "f5")
+    phases = experiment.get("branch_probability_phases", [])
+    trace: list[str] = []
+    for index in range(repetitions):
+        probabilities = next(
+            (
+                phase.get("probabilities", {})
+                for phase in phases
+                if int(phase.get("start", 0)) <= index < int(phase.get("end", 2**31))
+            ),
+            {branch: 0.25 for branch in branches},
+        )
+        weights = [max(0.0, float(probabilities.get(branch, 0.0))) for branch in branches]
+        trace.append(random.Random(f"{seed}:{index}").choices(branches, weights=weights, k=1)[0])
+    return trace
+
+
 def _run_one(
     base_config: dict[str, Any],
     dag_name: str,
@@ -133,6 +169,7 @@ def _run_one(
     profile_mismatch: bool = False,
     timing_jitter_ms: float = 0.0,
     branch_seed: int = 0,
+    branch_trace: list[str] | None = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base_config)
     exp = config.setdefault("experiment", {})
@@ -144,6 +181,8 @@ def _run_one(
     exp["profile_mismatch"] = profile_mismatch
     exp["timing_jitter_ms"] = timing_jitter_ms
     exp["branch_seed"] = branch_seed
+    if branch_trace is not None:
+        exp["branch_trace"] = list(branch_trace)
 
     run_stamp = _utc_timestamp()
     output_dir = output_root / f"{run_stamp}_{_safe_name(dag_name)}_{_safe_name(baseline)}_B{budget}"
@@ -188,10 +227,25 @@ def main(argv: list[str] | None = None) -> int:
     failed_path.write_text("", encoding="utf-8")
 
     base_config = load_yaml(args.config)
+    initial_history = _materialize_initial_history(base_config)
+    resolved_branch_seed = int(
+        args.branch_seed
+        if args.branch_seed is not None
+        else base_config.get("experiment", {}).get("branch_seed", 0)
+    )
+    planner_cfg = base_config.get("planner", {})
+    history_fingerprint = hashlib.sha256(
+        json.dumps(initial_history, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     timestamp = _utc_timestamp()
     configs = list(itertools.product(args.dags, args.baselines, args.budgets))
     if args.randomize_order:
-        random.shuffle(configs)
+        random.Random(args.order_seed).shuffle(configs)
+    traces = {
+        dag_name: _adaptive_branch_trace(base_config, args.repetitions, resolved_branch_seed)
+        for dag_name in args.dags
+        if dag_name == "adaptive_branch"
+    }
 
     manifest = {
         "timestamp": timestamp,
@@ -203,12 +257,24 @@ def main(argv: list[str] | None = None) -> int:
         "cooldown_sec": args.cooldown_sec,
         "profile_mismatch": args.profile_mismatch,
         "timing_jitter_ms": args.timing_jitter_ms,
-        "branch_seed": args.branch_seed,
+        "branch_seed": resolved_branch_seed,
         "randomize_order": args.randomize_order,
+        "order_seed": args.order_seed,
+        "realized_config_order": [list(item) for item in configs],
         "dry_run": dry_run,
         "planner_type": base_config.get("planner", {}).get("type", "heuristic"),
         "output_root": str(output_root),
         "run_count": len(configs),
+        "history_isolation": "independent_controller_per_strategy_from_deepcopied_config",
+        "initial_history_size": len(initial_history),
+        "initial_history_sha256": history_fingerprint,
+        "branch_history_window": planner_cfg.get("branch_history_window"),
+        "branch_prior_alpha": planner_cfg.get("branch_prior_alpha", 0.0),
+        "materialized_branch_traces": traces,
+        "branch_trace_sha256": {
+            dag_name: hashlib.sha256(json.dumps(trace, separators=(",", ":")).encode("utf-8")).hexdigest()
+            for dag_name, trace in traces.items()
+        },
     }
     rows: list[dict[str, Any]] = []
     _write_matrix_outputs(output_root, rows, manifest)
@@ -226,7 +292,8 @@ def main(argv: list[str] | None = None) -> int:
                 timestamp,
                 args.profile_mismatch,
                 args.timing_jitter_ms,
-                args.branch_seed,
+                resolved_branch_seed,
+                traces.get(dag_name),
             )
             rows.append(row)
             _write_matrix_outputs(output_root, rows, manifest)

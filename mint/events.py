@@ -11,6 +11,7 @@ class EventBase:
     event_type: str
     run_id: str
     timestamp: str = field(default_factory=utc_now_iso)
+    workflow_index: int = -1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,6 +69,7 @@ class SchedulerDecision(EventBase):
     model_history_size: int = 0
     branch_probabilities: str = "{}"
     supersedes_intent_id: str = ""
+    decision_node: str = ""
 
 
 @dataclass
@@ -77,6 +79,7 @@ class BranchModelEvent(EventBase):
     branch_counts: str = "{}"
     branch_probabilities: str = "{}"
     observed_branch: str = ""
+    decision_node: str = ""
 
 
 @dataclass

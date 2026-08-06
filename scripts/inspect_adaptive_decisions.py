@@ -36,7 +36,7 @@ def main() -> int:
             None,
         )
         runtime_model = next(
-            (event for event in events if event.get("event_type") == "branch_model" and event.get("decision_phase") == "runtime_after_f1"),
+            (event for event in events if event.get("event_type") == "branch_model" and event.get("decision_phase") == "runtime_after_branch"),
             None,
         )
         if not initial_model or not runtime_model:
@@ -51,7 +51,7 @@ def main() -> int:
             f"{event.get('action')}:{event.get('logical_name')}"
             for event in events
             if event.get("event_type") == "scheduler_decision"
-            and event.get("decision_phase") == "runtime_after_f1"
+            and event.get("decision_phase") == "runtime_after_branch"
         ]
         print(
             f"{run_id} history={initial_model['history_size']} "

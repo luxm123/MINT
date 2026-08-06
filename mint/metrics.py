@@ -30,7 +30,11 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
     useful_warmup = sum(1 for e in warmup_events if e.get("useful"))
     wasted_warmup = total_warmup - useful_warmup
     warmed = {(e.get("run_id"), e.get("logical_name")) for e in warmup_events}
-    intended = {(e.get("run_id"), e.get("logical_name")) for e in decision_events}
+    intended = {
+        (e.get("run_id"), e.get("logical_name"))
+        for e in decision_events
+        if e.get("action") in {"execute", "replacement_warmup"}
+    }
     covered = warmed | intended
     cold_reals = {(e.get("run_id"), e.get("logical_name")) for e in invocation_events if e.get("cold_start")}
     missed_warmup = len(cold_reals & warmed)

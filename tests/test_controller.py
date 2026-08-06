@@ -491,13 +491,13 @@ def test_adaptive_markov_learns_from_past_then_replaces_after_f1(tmp_path):
     assert {event["logical_name"] for event in warmups if event["action"] == "replacement_warmup"} == {"f8"}
     assert len(warmups) == 2
     assert any(
-        event["decision_phase"] == "runtime_after_f1"
+        event["decision_phase"] == "runtime_after_branch"
         and event["logical_name"] == "f2"
         and event["action"] == "invalidate_executed"
         for event in decisions
     )
     assert any(
-        event["decision_phase"] == "runtime_after_f1"
+        event["decision_phase"] == "runtime_after_branch"
         and event["logical_name"] == "f8"
         and event["action"] == "replacement_warmup"
         for event in decisions
@@ -564,7 +564,7 @@ def test_runtime_replanning_is_enabled_for_non_adaptive_dynamic_dag(tmp_path):
     events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
     runtime_models = [
         event for event in events
-        if event.get("event_type") == "branch_model" and event.get("decision_phase") == "runtime_after_f1"
+        if event.get("event_type") == "branch_model" and event.get("decision_phase") == "runtime_after_branch"
     ]
     assert result["warmup_count"] <= 2
     assert runtime_models
