@@ -40,7 +40,20 @@ class WarmupEvent(EventBase):
     logical_name: str = ""
     intent_id: str = ""
     action: str = "execute"
+    # Compatibility metric: a successful on-path warmup that completed before
+    # its explicitly recorded fairness deadline. This deliberately does not
+    # claim that AWS reused the same execution environment; that is derived
+    # separately from non-empty environment UUIDs and the real-call cold flag.
     useful: bool = False
+    target_hit: bool = False
+    ready_before_deadline: bool = False
+    readiness_deadline_type: str = ""
+    ready_before_arrival: bool | None = None
+    ready_before_node_demand: bool | None = None
+    # Deprecated compatibility alias for ready_before_deadline. Older result
+    # readers expect this field, although an initial warmup's deadline is the
+    # planned workflow arrival rather than the target node's invocation.
+    ready_before_demand: bool = False
     action_reason: str = ""
     gain: float = 0.0
     invocation_type: str = "warmup"
@@ -54,6 +67,12 @@ class WarmupEvent(EventBase):
     error_message: str = ""
     overlap_duration_ms: float = 0.0
     blocking_wait_ms: float = 0.0
+    submit_to_collect_ms: float = 0.0
+    warmup_wall_ms: float = 0.0
+    missed_at_arrival: bool = False
+    missed_at_node_demand: bool = False
+    # Deprecated compatibility alias paired with ready_before_demand.
+    missed_at_demand: bool = False
 
 
 @dataclass
@@ -83,6 +102,26 @@ class BranchModelEvent(EventBase):
 
 
 @dataclass
+class IntentLifecycleEvent(EventBase):
+    intent_id: str = ""
+    function_name: str = ""
+    logical_name: str = ""
+    state_before: str = ""
+    state_after: str = ""
+    action: str = ""
+    reason: str = ""
+    reserved_budget: int = 0
+    consumed_budget: int = 0
+    actual_call_submitted: bool = False
+    supersedes_intent_id: str = ""
+    decision_phase: str = "initial"
+    accepted: bool = True
+    submission_lateness_ms: float = 0.0
+    submission_offset_ms: float = 0.0
+    transition_seq: int = 0
+
+
+@dataclass
 class WorkflowRunSummary(EventBase):
     dag: str = ""
     baseline: str = ""
@@ -90,6 +129,13 @@ class WorkflowRunSummary(EventBase):
     latency_ms: float = 0.0
     cold_start_count: int = 0
     warmup_count: int = 0
+    reserved_budget: int = 0
+    consumed_budget: int = 0
+    budget_limit: int = 0
+    unused_budget: int = 0
+    warmup_error_count: int = 0
+    scheduler_error_count: int = 0
+    scheduler_status: str = "ok"
     status: str = "ok"
     start_time: str = ""
     end_time: str = ""

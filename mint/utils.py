@@ -5,9 +5,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 import yaml
+
+
+_JSONL_APPEND_LOCK = Lock()
 
 
 def utc_now_iso() -> str:
@@ -15,7 +19,11 @@ def utc_now_iso() -> str:
 
 
 def monotonic_sec() -> float:
-    return time.monotonic()
+    # perf_counter is monotonic and provides sub-millisecond resolution on
+    # Windows builds where time.monotonic() may be backed by the 15.625 ms
+    # GetTickCount64 clock.  Intent cancellation/readiness races need the
+    # higher-resolution boundary.
+    return time.perf_counter()
 
 
 def new_id(prefix: str) -> str:
@@ -35,9 +43,10 @@ def ensure_dir(path: str | Path) -> Path:
 
 def append_jsonl(path: str | Path, record: dict[str, Any]) -> None:
     target = Path(path)
-    ensure_dir(target.parent)
-    with target.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    with _JSONL_APPEND_LOCK:
+        ensure_dir(target.parent)
+        with target.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:

@@ -31,6 +31,15 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _ready_before_deadline(event: dict[str, Any]) -> bool:
+    return bool(
+        event.get(
+            "ready_before_deadline",
+            event.get("ready_before_demand", event.get("useful", False)),
+        )
+    )
+
+
 def _load_outputs(root: Path) -> dict[str, Path]:
     rows = list(csv.DictReader((root / "summary_matrix.csv").open(newline="", encoding="utf-8")))
     outputs = {row["baseline"]: Path(row["output_dir"]) for row in rows if row["baseline"] in CORE_BASELINES}
@@ -61,6 +70,15 @@ def _initial_targets(events: list[dict[str, Any]]) -> list[str]:
 
 
 def _runtime_targets(events: list[dict[str, Any]]) -> list[str]:
+    return sorted({
+        str(event["logical_name"])
+        for event in events
+        if event.get("event_type") == "scheduler_decision"
+        and event.get("action") in {"execute_pending", "replacement_warmup"}
+    })
+
+
+def _replacement_targets(events: list[dict[str, Any]]) -> list[str]:
     return sorted({
         str(event["logical_name"])
         for event in events
@@ -144,17 +162,26 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
     selected_by_strategy: dict[str, dict[int, set[str]]] = {baseline: {} for baseline in CORE_BASELINES}
     initial_by_strategy: dict[str, dict[int, set[str]]] = {baseline: {} for baseline in CORE_BASELINES}
     metrics: dict[str, dict[str, int]] = {
-        baseline: {"warmups": 0, "useful": 0, "wasted": 0, "invalidated": 0, "replacements": 0}
+        baseline: {
+            "warmups": 0,
+            "target_hits": 0,
+            "timely_warmups": 0,
+            "off_path_warmups": 0,
+            "late_target_warmups": 0,
+            "invalidated": 0,
+            "replacements": 0,
+        }
         for baseline in CORE_BASELINES
     }
     phase_metrics = {
         baseline: {
-            "pre_switch": {"warmups": 0, "useful": 0, "wasted": 0},
-            "post_switch": {"warmups": 0, "useful": 0, "wasted": 0},
+            "pre_switch": {"warmups": 0, "target_hits": 0, "timely_warmups": 0},
+            "post_switch": {"warmups": 0, "target_hits": 0, "timely_warmups": 0},
         }
         for baseline in CORE_BASELINES
     }
     warmup_error_count = 0
+    scheduler_error_count = 0
     runtime_order_valid = True
     for index in range(expected_runs):
         row: dict[str, Any] = {"workflow_index": index, "phase": "pre_switch" if index < switch_index else "post_switch", "actual_branch": reference_trace[index]}
@@ -162,31 +189,54 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
             events = grouped[baseline][index]
             initial = _initial_targets(events)
             runtime = _runtime_targets(events)
+            replacements = _replacement_targets(events)
             invalidated = _invalidated_targets(events)
             final_targets = set(initial) - set(invalidated) | set(runtime)
             initial_by_strategy[baseline][index] = set(initial)
             selected_by_strategy[baseline][index] = final_targets
             warmups = [event for event in events if event.get("event_type") == "warmup"]
+            target_hits = sum(bool(event.get("target_hit", event.get("useful"))) for event in warmups)
+            timely_warmups = sum(
+                _ready_before_deadline(event)
+                and event.get("status", "ok") != "error"
+                for event in warmups
+            )
             warmup_error_count += sum(event.get("status") == "error" for event in warmups)
+            scheduler_error_count += sum(
+                event.get("event_type") == "scheduler_decision"
+                and event.get("action") == "scheduler_error"
+                for event in events
+            )
             phase = "pre_switch" if index < switch_index else "post_switch"
             metrics[baseline]["warmups"] += len(warmups)
-            metrics[baseline]["useful"] += sum(bool(event.get("useful")) for event in warmups)
-            metrics[baseline]["wasted"] += sum(not bool(event.get("useful")) for event in warmups)
+            metrics[baseline]["target_hits"] += target_hits
+            metrics[baseline]["timely_warmups"] += timely_warmups
+            metrics[baseline]["off_path_warmups"] += len(warmups) - target_hits
+            metrics[baseline]["late_target_warmups"] += target_hits - timely_warmups
             metrics[baseline]["invalidated"] += len(invalidated)
-            metrics[baseline]["replacements"] += len(runtime)
+            metrics[baseline]["replacements"] += len(replacements)
             phase_metrics[baseline][phase]["warmups"] += len(warmups)
-            phase_metrics[baseline][phase]["useful"] += sum(bool(event.get("useful")) for event in warmups)
-            phase_metrics[baseline][phase]["wasted"] += sum(not bool(event.get("useful")) for event in warmups)
+            phase_metrics[baseline][phase]["target_hits"] += target_hits
+            phase_metrics[baseline][phase]["timely_warmups"] += timely_warmups
             if runtime:
                 reveal_position = next(
                     (position for position, event in enumerate(events) if event.get("event_type") == "invocation" and event.get("observed_branch")),
                     None,
                 )
-                replacement_position = next(
-                    (position for position, event in enumerate(events) if event.get("event_type") == "scheduler_decision" and event.get("action") == "replacement_warmup"),
+                runtime_position = next(
+                    (
+                        position
+                        for position, event in enumerate(events)
+                        if event.get("event_type") == "scheduler_decision"
+                        and event.get("action") in {"execute_pending", "replacement_warmup"}
+                    ),
                     None,
                 )
-                runtime_order_valid &= reveal_position is not None and replacement_position is not None and reveal_position < replacement_position
+                runtime_order_valid &= (
+                    reveal_position is not None
+                    and runtime_position is not None
+                    and reveal_position < runtime_position
+                )
             row[f"{baseline}_initial"] = "/".join(initial)
             row[f"{baseline}_invalidated"] = "/".join(invalidated)
             row[f"{baseline}_runtime"] = "/".join(runtime)
@@ -205,7 +255,7 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
         for index in range(expected_runs)
     )
     branch_nodes = {"f2", "f3", "f4", "f5"}
-    branch_choice_disagreements = sum(
+    initial_branch_node_selection_disagreements = sum(
         (initial_by_strategy["xanadu_like"][index] & branch_nodes)
         != (initial_by_strategy["mint_markov_full"][index] & branch_nodes)
         for index in range(expected_runs)
@@ -222,7 +272,16 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
         first_hot = next((index for index in post_indices if hot_target in initial_selected[index]), None)
         strategy_stats[baseline] = {
             **metrics[baseline],
-            "local_target_hit_rate": metrics[baseline]["useful"] / metrics[baseline]["warmups"] if metrics[baseline]["warmups"] else 0.0,
+            "local_target_hit_rate": (
+                metrics[baseline]["target_hits"] / metrics[baseline]["warmups"]
+                if metrics[baseline]["warmups"]
+                else 0.0
+            ),
+            "local_timely_warmup_rate": (
+                metrics[baseline]["timely_warmups"] / metrics[baseline]["warmups"]
+                if metrics[baseline]["warmups"]
+                else 0.0
+            ),
             "phase_metrics": phase_metrics[baseline],
             "first_post_switch_hot_target_index": first_hot,
             "first_three_consecutive_hot_target_index": _first_consecutive(post_indices, initial_selected, hot_target),
@@ -232,6 +291,8 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
 
     if warmup_error_count:
         raise ValueError(f"warmup failures found in paired pilot: {warmup_error_count}")
+    if scheduler_error_count:
+        raise ValueError(f"scheduler failures found in paired pilot: {scheduler_error_count}")
     if not runtime_order_valid:
         raise ValueError("runtime replacement occurred before its branch reveal")
 
@@ -240,11 +301,20 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
             "same_branch_trace": trace_equal,
             "same_history_snapshots": history_snapshots_equal,
             "no_warmup_errors": warmup_error_count == 0,
+            "no_scheduler_errors": scheduler_error_count == 0,
             "runtime_replanning_after_branch_reveal": runtime_order_valid,
             "expected_runs": expected_runs,
             "budget": budget,
         },
         "branch_trace": reference_trace,
+        "execution_evidence": {
+            "mode": "dry_run_decision_audit",
+            "paper_performance_eligible": False,
+            "latency_warning": (
+                "Dry-run wall-clock and simulated cold-start metrics validate only "
+                "decision/lifecycle behavior and must not support paper performance claims."
+            ),
+        },
         "strategy_stats": strategy_stats,
         "mint_xanadu": {
             "target_disagreement_count": target_disagreements,
@@ -253,8 +323,12 @@ def analyze(root: Path, expected_runs: int, switch_index: int, hot_target: str, 
             "stage_aware_disagreement_ratio": stage_disagreements / expected_runs,
             "initial_set_disagreement_count": initial_disagreements,
             "initial_set_disagreement_ratio": initial_disagreements / expected_runs,
-            "predicted_branch_disagreement_count": branch_choice_disagreements,
-            "predicted_branch_disagreement_ratio": branch_choice_disagreements / expected_runs,
+            "initial_branch_node_selection_disagreement_count": (
+                initial_branch_node_selection_disagreements
+            ),
+            "initial_branch_node_selection_disagreement_ratio": (
+                initial_branch_node_selection_disagreements / expected_runs
+            ),
         },
         "paired_rows": paired_rows,
     }

@@ -40,6 +40,20 @@ def test_experiment_matrix_dry_run_generates_summary(tmp_path):
     assert matrix_csv.exists()
     assert matrix_json.exists()
     assert manifest.exists()
+    provenance_path = output_root / "provenance.json"
+    resolved_config_path = output_root / "resolved_config.json"
+    assert provenance_path.exists()
+    assert resolved_config_path.exists()
+    manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    assert manifest_data["provenance"]["resolved_config"]["sha256"] == provenance[
+        "resolved_config"
+    ]["sha256"]
+    assert provenance["git"]["commit_sha"]
+    assert isinstance(provenance["git"]["dirty"], bool)
+    assert provenance["git"]["dirty_state_sha256"]
+    resolved = json.loads(resolved_config_path.read_text(encoding="utf-8"))
+    assert resolved["matrix"]["materialized_branch_traces"] == {}
     rows = pd.read_csv(matrix_csv)
     assert len(rows) == 4
     assert "uncovered_cold_start" in rows.columns
@@ -147,7 +161,12 @@ def test_ablation_baselines_generate_matrix_events_and_figures(tmp_path):
         "oracle_path",
     }
     assert (output_root / "failed_runs.jsonl").read_text(encoding="utf-8") == ""
-    assert all(rows["execute_count"] + rows["replacement_warmup_count"] >= rows["total_warmup"])
+    assert all(
+        rows["execute_count"]
+        + rows["execute_pending_count"]
+        + rows["replacement_warmup_count"]
+        >= rows["total_warmup"]
+    )
     assert all(rows["replace_count"] >= 0)
     for output_dir in rows["output_dir"]:
         assert (output_root / "summary_matrix.csv").exists()

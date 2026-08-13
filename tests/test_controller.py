@@ -20,7 +20,8 @@ def test_static_dag_and_mint_offline_obey_warmup_budget(tmp_path):
         summary = controller.run(3)
         assert summary["total_warmup"] == 6
         assert summary["execute_count"] == 6
-        assert summary["cancel_pending_count"] == 3
+        assert summary["cancel_pending_count"] == 0
+        assert summary["not_selected_count"] == 3
 
 
 def test_unlimited_static_baseline_can_warm_all_nodes(tmp_path):
@@ -41,7 +42,8 @@ def test_periodic_keepwarm_and_orion_like_obey_warmup_budget(tmp_path):
         summary = controller.run(2)
         assert summary["total_warmup"] == 4
         assert summary["execute_count"] == 4
-        assert summary["cancel_pending_count"] == 2
+        assert summary["cancel_pending_count"] == 0
+        assert summary["not_selected_count"] == 2
 
 
 def _events(path):
@@ -64,7 +66,7 @@ def test_path_aware_greedy_does_not_use_full_selected_path(tmp_path):
     assert "f3" in invoked
     assert "f2" not in invoked
     assert any(node not in dag.entry_nodes for node in warmed)
-    assert any(event.get("action") == "cancel_pending" for event in events if event.get("event_type") == "scheduler_decision")
+    assert any(event.get("action") == "not_selected" for event in events if event.get("event_type") == "scheduler_decision")
 
 
 def test_path_aware_greedy_uses_profile_future_candidates_and_budget(tmp_path):
@@ -81,7 +83,7 @@ def test_path_aware_greedy_uses_profile_future_candidates_and_budget(tmp_path):
     assert summary["total_warmup"] == 2
     assert len(warmed) == 2
     assert any(node not in dag.entry_nodes for node in warmed)
-    assert sum(1 for event in decisions if event.get("action") == "cancel_pending") == len(dag.nodes) - 2
+    assert sum(1 for event in decisions if event.get("action") == "not_selected") == len(dag.nodes) - 2
     assert not any(event.get("action") == "delay" for event in decisions)
 
 
@@ -154,7 +156,7 @@ def test_mint_markov_offline_executes_only_offline_top_budget_without_runtime_re
     assert executed == expected
     assert all(event["action_reason"].startswith("mint_markov_offline_") for event in decisions)
     assert not any(event["action"] == "delay" for event in decisions)
-    assert sum(event["action"] == "cancel_pending" for event in decisions) == len(planned) - 2
+    assert sum(event["action"] == "not_selected" for event in decisions) == len(planned) - 2
 
 
 def test_mint_markov_no_runtime_reval_uses_offline_rank_budget_and_hot_guard(tmp_path, monkeypatch):
@@ -179,7 +181,7 @@ def test_mint_markov_no_runtime_reval_uses_offline_rank_budget_and_hot_guard(tmp
         assert len(executes) <= 2
         assert not any(event["action"] == "replacement_warmup" for event in decisions)
     second_run_decisions = [event for event in events if event.get("event_type") == "scheduler_decision" and event["run_id"] == run_ids[1]]
-    assert any(event["action"] == "cancel_pending" and event["action_reason"] == "mint_markov_no_runtime_reval_already_hot" for event in second_run_decisions)
+    assert any(event["action"] == "not_selected" and event["action_reason"] == "mint_markov_no_runtime_reval_already_hot" for event in second_run_decisions)
 
 
 def test_mint_markov_no_long_horizon_uses_runtime_scheduler_without_structural_benefit(tmp_path, monkeypatch):
@@ -268,7 +270,10 @@ def test_greedy_trap_mint_and_path_aware_targets_differ_without_path_leak(tmp_pa
     greedy_decisions = [event for event in greedy_events if event.get("event_type") == "scheduler_decision"]
     mint_decisions = [event for event in mint_events if event.get("event_type") == "scheduler_decision"]
     assert sum(1 for event in greedy_decisions if event.get("action") == "execute") <= 2
-    assert any(event.get("action") in {"cancel_pending", "replacement_warmup"} for event in mint_decisions)
+    assert any(
+        event.get("action") in {"plan_pending", "execute_pending", "cancel_pending", "replacement_warmup"}
+        for event in mint_decisions
+    )
 
 
 def test_mint_no_long_horizon_and_full_respect_deadline_and_budget_on_greedy_trap(tmp_path):
@@ -315,7 +320,10 @@ def test_mint_variants_have_explainable_action_differences_without_path_leak(tmp
     assert all(len(nodes) <= 2 for nodes in warmups.values())
     assert all("f1" not in nodes for nodes in warmups.values())
     assert "replacement_warmup" not in actions["mint_markov_no_runtime_reval"]
-    assert all(action in {"execute", "delay", "cancel_pending", "invalidate_executed", "replacement_warmup"}
+    assert all(action in {
+        "execute", "delay", "not_selected", "plan_pending", "execute_pending",
+        "cancel_pending", "invalidate_executed", "replacement_warmup",
+    }
                for action in actions["mint_markov_full"])
 
 
@@ -455,6 +463,39 @@ def test_warmup_overrun_is_counted_in_end_to_end_latency(tmp_path, monkeypatch):
     assert result["block_id"] == "block-0000"
 
 
+def test_default_arrival_preserves_configured_warmup_lead(tmp_path):
+    config = _config(tmp_path, "mint_markov_full")
+    config["experiment"]["warmup_lead_sec"] = 0.03
+    controller = MintController(
+        config,
+        dag=get_workload("chain"),
+        baseline="mint_markov_full",
+        dry_run=True,
+    )
+
+    result = controller.run_once(0)
+    events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
+    warmups = [event for event in events if event.get("event_type") == "warmup"]
+
+    assert warmups
+    assert all(event["readiness_deadline_type"] == "planned_arrival" for event in warmups)
+    assert all(event["ready_before_arrival"] is True for event in warmups)
+    assert result["warmup_overrun_ms"] == 0.0
+
+
+def test_local_only_config_rejects_real_aws_mode(tmp_path):
+    config = _config(tmp_path, "no_warmup")
+    config["experiment"]["local_only"] = True
+
+    with pytest.raises(ValueError, match="local_only=true"):
+        MintController(
+            config,
+            dag=get_workload("chain"),
+            baseline="no_warmup",
+            dry_run=False,
+        )
+
+
 def test_no_executed_warmup_never_reports_warmup_overrun(tmp_path, monkeypatch):
     config = _config(tmp_path, "mint_markov_full")
     config["experiment"]["warmup_lead_sec"] = 0
@@ -571,7 +612,7 @@ def test_runtime_replanning_is_enabled_for_non_adaptive_dynamic_dag(tmp_path):
     assert runtime_models[0]["observed_branch"] in {"f2", "f3"}
 
 
-def test_async_runtime_warmup_failure_is_logged_and_propagated(tmp_path, monkeypatch):
+def test_async_runtime_warmup_failure_is_logged_and_business_continues(tmp_path, monkeypatch):
     def failing_runtime_warmup(function_name, payload, invocation_type="RequestResponse", dry_run=True, region_name=None):
         if payload["invocation_type"] == "warmup" and payload["function_name"] == "f8":
             raise TimeoutError("synthetic runtime warmup timeout")
@@ -589,13 +630,17 @@ def test_async_runtime_warmup_failure_is_logged_and_propagated(tmp_path, monkeyp
     }
     controller = MintController(config, dag=dag, baseline="mint_markov_full", dry_run=True)
 
-    with pytest.raises(TimeoutError, match="synthetic runtime warmup timeout"):
-        controller.run_once(0)
+    result = controller.run_once(0)
     events = _events(tmp_path / "mint_markov_full" / "events.jsonl")
     failures = [event for event in events if event.get("event_type") == "warmup" and event.get("status") == "error"]
     assert len(failures) == 1
     assert failures[0]["action"] == "replacement_warmup"
     assert failures[0]["error_type"] == "TimeoutError"
+    assert result["status"] == "ok"
+    assert result["scheduler_status"] == "degraded"
+    assert result["warmup_error_count"] == 1
+    invocations = [event["logical_name"] for event in events if event.get("event_type") == "invocation"]
+    assert invocations == ["f1", "f4", "f8"]
 
 
 def test_orion_xanadu_and_oracle_use_same_budget(tmp_path):

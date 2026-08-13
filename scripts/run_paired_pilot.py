@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mint.controller import MintController
+from mint.provenance import write_experiment_provenance
 from mint.utils import ensure_dir, load_yaml, monotonic_sec
 from mint.workloads import get_workload
 
@@ -71,6 +72,7 @@ def main() -> int:
     output_root = ensure_dir(args.output_root)
     base_config = load_yaml(args.config)
     controllers: dict[str, MintController] = {}
+    resolved_strategy_configs: dict[str, dict[str, Any]] = {}
     summaries: dict[str, list[dict[str, Any]]] = {baseline: [] for baseline in args.baselines}
 
     for baseline, pool in zip(args.baselines, args.pools):
@@ -88,6 +90,7 @@ def main() -> int:
                 "dry_run": dry_run,
             }
         )
+        resolved_strategy_configs[baseline] = copy.deepcopy(config)
         controllers[baseline] = MintController(
             config,
             dag=get_workload(args.dag),
@@ -101,6 +104,56 @@ def main() -> int:
     next_slot = start_mono + args.initial_delay_sec
     trace_rows: list[dict[str, Any]] = []
     orders = balanced_orders(args.baselines, args.blocks, args.seed)
+    manifest = {
+        "mode": "continuous_paired_pilot",
+        "config": args.config,
+        "dag": args.dag,
+        "baselines": args.baselines,
+        "pools": args.pools,
+        "blocks": args.blocks,
+        "budget": args.budget,
+        "seed": args.seed,
+        "slot_spacing_sec": args.slot_spacing_sec,
+        "warmup_lead_sec": args.warmup_lead_sec,
+        "initial_delay_sec": args.initial_delay_sec,
+        "profile_mismatch": args.profile_mismatch,
+        "dry_run": dry_run,
+        "started_at": start_wall.isoformat(),
+        "realized_strategy_orders": orders,
+    }
+    resolved_snapshot = {
+        "source_config_path": str(Path(args.config).resolve()),
+        "base_config": base_config,
+        "strategy_configs": resolved_strategy_configs,
+        "pilot": {
+            key: manifest[key]
+            for key in (
+                "mode",
+                "dag",
+                "baselines",
+                "pools",
+                "blocks",
+                "budget",
+                "seed",
+                "slot_spacing_sec",
+                "warmup_lead_sec",
+                "initial_delay_sec",
+                "profile_mismatch",
+                "dry_run",
+                "realized_strategy_orders",
+            )
+        },
+    }
+    manifest["provenance"] = write_experiment_provenance(
+        output_root,
+        resolved_snapshot,
+        repository=ROOT,
+    )
+    manifest_path = output_root / "experiment_manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     for block_index, order in enumerate(orders):
         order_text = ",".join(order)
         block_id = f"block-{block_index:04d}"
@@ -134,22 +187,8 @@ def main() -> int:
         controller.finalize(summaries[baseline])
 
     _write_trace(output_root / "paired_trace.csv", trace_rows)
-    manifest = {
-        "mode": "continuous_paired_pilot",
-        "config": args.config,
-        "dag": args.dag,
-        "baselines": args.baselines,
-        "pools": args.pools,
-        "blocks": args.blocks,
-        "budget": args.budget,
-        "seed": args.seed,
-        "slot_spacing_sec": args.slot_spacing_sec,
-        "warmup_lead_sec": args.warmup_lead_sec,
-        "profile_mismatch": args.profile_mismatch,
-        "dry_run": dry_run,
-        "started_at": start_wall.isoformat(),
-    }
-    (output_root / "experiment_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     print(f"Wrote paired pilot to {output_root}")
     return 0
 

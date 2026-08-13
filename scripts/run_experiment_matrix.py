@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from mint.controller import MintController
 from mint.branch_history import read_branch_records
+from mint.provenance import write_experiment_provenance
 from mint.utils import append_jsonl, ensure_dir, load_yaml
 from mint.workloads import get_workload
 
@@ -34,12 +35,37 @@ SUMMARY_FIELDS = [
     "repetitions",
     "output_dir",
     "workflow_runs",
+    "aborted_run_count",
+    "consumed_budget_total",
+    "reserved_budget_final_total",
+    "unused_budget_total",
+    "budget_limit_per_run",
     "end_to_end_latency_ms_avg",
     "p50_latency_ms",
     "p95_latency_ms",
     "p99_latency_ms",
     "cold_start_count",
     "cold_start_rate",
+    "target_hit_warmup",
+    "target_hit_ratio",
+    "ready_before_deadline_warmup",
+    "ready_before_deadline_ratio",
+    "ready_before_arrival_warmup",
+    "ready_before_node_demand_warmup",
+    "ready_before_demand_warmup",
+    "ready_before_demand_ratio",
+    "off_path_warmup",
+    "late_target_warmup",
+    "missed_at_demand_count",
+    "missed_at_arrival_count",
+    "missed_at_node_demand_count",
+    "reuse_verified_warmup",
+    "environment_reused_warmup",
+    "effective_warmup",
+    "environment_reuse_ratio",
+    "effective_warmup_ratio",
+    "reuse_audit_coverage_ratio",
+    "verified_on_path_effectiveness_ratio",
     "total_warmup",
     "useful_warmup",
     "wasted_warmup",
@@ -48,10 +74,21 @@ SUMMARY_FIELDS = [
     "uncovered_cold_start",
     "useful_warmup_ratio",
     "execute_count",
+    "execute_pending_count",
+    "plan_pending_count",
+    "not_selected_count",
     "delay_count",
     "cancel_pending_count",
     "invalidate_executed_count",
     "replacement_warmup_count",
+    "lifecycle_submitted_count",
+    "lifecycle_cancel_pending_count",
+    "warmup_error_count",
+    "warmup_error_total",
+    "scheduler_error_total",
+    "degraded_scheduler_run_count",
+    "cancel_race_lost_count",
+    "in_flight_at_demand_count",
     "cancel_count",
     "replace_count",
 ]
@@ -224,7 +261,6 @@ def main(argv: list[str] | None = None) -> int:
 
     output_root = ensure_dir(args.output_root)
     failed_path = output_root / "failed_runs.jsonl"
-    failed_path.write_text("", encoding="utf-8")
 
     base_config = load_yaml(args.config)
     initial_history = _materialize_initial_history(base_config)
@@ -276,6 +312,32 @@ def main(argv: list[str] | None = None) -> int:
             for dag_name, trace in traces.items()
         },
     }
+    resolved_snapshot = {
+        "source_config_path": str(Path(args.config).resolve()),
+        "base_config": base_config,
+        "matrix": {
+            "dags": list(args.dags),
+            "baselines": list(args.baselines),
+            "budgets": list(args.budgets),
+            "repetitions": args.repetitions,
+            "cooldown_sec": args.cooldown_sec,
+            "profile_mismatch": args.profile_mismatch,
+            "timing_jitter_ms": args.timing_jitter_ms,
+            "branch_seed": resolved_branch_seed,
+            "randomize_order": args.randomize_order,
+            "order_seed": args.order_seed,
+            "realized_config_order": [list(item) for item in configs],
+            "dry_run": dry_run,
+            "output_root": str(output_root.resolve()),
+            "materialized_branch_traces": traces,
+        },
+    }
+    manifest["provenance"] = write_experiment_provenance(
+        output_root,
+        resolved_snapshot,
+        repository=ROOT,
+    )
+    failed_path.write_text("", encoding="utf-8")
     rows: list[dict[str, Any]] = []
     _write_matrix_outputs(output_root, rows, manifest)
 

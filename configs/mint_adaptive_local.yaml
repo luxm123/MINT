@@ -12,10 +12,27 @@ aws:
     f9: mint-f9
 
 experiment:
+  # This timing profile is calibrated only for deterministic local lifecycle
+  # validation. A real AWS smoke test must use a separately calibrated config.
+  local_only: true
   dag: adaptive_branch
   baseline: mint_markov_full
   repetitions: 20
   warmup_budget: 2
+  # The intent-maintenance ablation is defined as one immediate warmup plus
+  # one reserved pending intent.  Keep this explicit so all three variants
+  # start from the same B=2 budget decomposition.
+  adaptive_initial_warmup_budget: 1
+  # All compared strategies use the same candidate set. The entry f1 is the
+  # observation point and is therefore excluded from predictive warmup.
+  exclude_entry_nodes_from_warmup: true
+  # Intent stays genuinely pending while f1 runs. Branch revelation may
+  # cancel/replace it before this timer submits the Lambda warmup.
+  adaptive_pending_delay_sec: 0.05
+  # Reserve an explicit pre-arrival window for the one immediate warmup.
+  # This value is for local lifecycle validation only; AWS must be calibrated
+  # separately from measured Lambda timing.
+  warmup_lead_sec: 0.2
   dry_run: true
   # Decision-audit pilot: prevent controller heat from suppressing later
   # prediction/replanning events. This is not an AWS cold-start mechanism.
