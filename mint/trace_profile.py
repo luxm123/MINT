@@ -130,26 +130,76 @@ def load_trace_profile(path: str | Path, source: str = "") -> TraceProfile:
 def calibrate_branch_probabilities(
     profile: TraceProfile,
     dag: WorkflowDAG,
+    *,
+    rank_fallback: bool = True,
 ) -> dict[str, dict[str, float]]:
-    """Normalize trace call counts of each branch successor into probabilities."""
+    """Normalize trace call counts of each branch successor into probabilities.
+
+    Direct name match: when the trace contains functions named like the DAG's
+    branch successors (synthetic or derived traces), probabilities are the
+    normalized call counts of those names.
+
+    Rank fallback (public traces): production serverless datasets (e.g.
+    Azure) identify functions by opaque names, not by DAG node names.  When
+    no successor name is present in the trace, the top-k most frequently
+    called trace functions are mapped to the branch successors in frequency
+    rank order, and their normalized frequencies become the branch
+    probabilities.  This keeps the trace's real call-frequency skew in the
+    microbenchmark profile.  The convention is deterministic and is recorded
+    in the calibration provenance (`branch_mapping`).
+    """
     result: dict[str, dict[str, float]] = {}
     for decision_node, _rule in dag.branch_rules.items():
         successors = dag.successors.get(decision_node, [])
+        if not successors:
+            continue
         counts = {
             successor: float(profile.call_counts.get(successor, 0.0))
             for successor in successors
         }
         total = sum(counts.values())
-        if total <= 0.0:
-            probabilities = {
-                successor: 1.0 / len(successors) for successor in successors
-            }
-        else:
+        if total > 0.0:
             probabilities = {
                 successor: counts[successor] / total for successor in successors
             }
+        elif rank_fallback and profile.call_counts:
+            ranked = sorted(
+                profile.call_counts.items(),
+                key=lambda item: (-float(item[1]), str(item[0])),
+            )
+            top = ranked[: len(successors)]
+            top_total = sum(float(count) for _, count in top)
+            if top_total > 0.0:
+                probabilities = {
+                    successor: float(count) / top_total
+                    for successor, (_, count) in zip(successors, top)
+                }
+            else:
+                probabilities = {
+                    successor: 1.0 / len(successors) for successor in successors
+                }
+        else:
+            probabilities = {
+                successor: 1.0 / len(successors) for successor in successors
+            }
         result[decision_node] = probabilities
     return result
+
+
+def flatten_branch_probabilities(
+    branch_probabilities: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """Flatten {decision_node: {target: probability}} into {target: probability}.
+
+    The Markov policy model consumes the flat per-branch map
+    (planner.branch_probabilities); the per-decision-node structure is kept
+    in experiment.trace_calibration for provenance.
+    """
+    return {
+        target: float(probability)
+        for mapping in branch_probabilities.values()
+        for target, probability in mapping.items()
+    }
 
 
 def apply_trace_calibration(
@@ -163,12 +213,28 @@ def apply_trace_calibration(
     planner = config.setdefault("planner", {})
 
     branch_probabilities = calibrate_branch_probabilities(profile, dag)
+    used_rank_fallback = any(
+        all(profile.call_counts.get(successor, 0.0) == 0.0 for successor in dag.successors.get(decision_node, []))
+        for decision_node in dag.branch_rules
+    )
     calibration = {
         "source": profile.source,
-        "branch_probabilities": branch_probabilities,
+        "branch_probabilities": {dag.name: branch_probabilities},
+        "branch_mapping": (
+            "rank_fallback_by_call_count" if used_rank_fallback else "direct_name_match"
+        ),
     }
-    experiment["trace_calibration"] = calibration
-    planner["branch_probabilities"] = dict(branch_probabilities)
+    existing = experiment.get("trace_calibration")
+    if existing:
+        existing.setdefault("branch_probabilities", {}).update(
+            calibration["branch_probabilities"]
+        )
+        existing["branch_mapping"] = calibration["branch_mapping"]
+    else:
+        experiment["trace_calibration"] = calibration
+    planner["branch_probabilities"] = flatten_branch_probabilities(
+        branch_probabilities
+    )
 
     for decision_node, mapping in branch_probabilities.items():
         if dag.name in {"branch", "mixed", "deep_mixed"}:
@@ -195,7 +261,5 @@ def apply_trace_calibration(
             max(0.05, float(profile.interarrival_sec_quantiles[1])), 3
         )
     if profile.cold_start_rate is not None:
-        experiment.setdefault("trace_calibration", calibration)[
-            "cold_start_rate"
-        ] = profile.cold_start_rate
+        experiment["trace_calibration"]["cold_start_rate"] = profile.cold_start_rate
     return config

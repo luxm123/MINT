@@ -12,6 +12,7 @@ from mint.trace_profile import (
     load_trace_profile,
 )
 from mint.workloads import get_workload
+from scripts import apply_trace_calibration as apply_trace_calibration_cli
 from scripts.analyze_cost_latency import build_cost_latency, pareto_front
 from scripts.analyze_seed_statistics import bootstrap_ci, build_dominance_table, build_statistics_table
 
@@ -55,7 +56,7 @@ def test_trace_profile_load_and_calibrate_wide_branch(tmp_path):
         "planner": {},
     }
     apply_trace_calibration(config, profile, dag)
-    assert config["experiment"]["trace_calibration"]["branch_probabilities"]["f1"]
+    assert config["experiment"]["trace_calibration"]["branch_probabilities"]["wide_branch"]["f1"]
     assert config["platform"]["default_cold_start_ms"] > 250.0
     assert config["experiment"]["stage_gap_sec"] > 0.0
 
@@ -69,6 +70,105 @@ def test_trace_calibration_deep_mixed_sets_left_probability(tmp_path):
     assert "branch_probability_left" in config["planner"]
     left = float(config["planner"]["branch_probability_left"])
     assert 0.0 <= left <= 1.0
+
+
+def test_calibrate_rank_fallback_maps_top_functions_by_frequency(tmp_path):
+    rows = []
+    counts = {"func_a": 40, "func_b": 30, "func_c": 20, "func_d": 10}
+    for function, count in counts.items():
+        for _ in range(count):
+            rows.append({"function": function, "durationMs": 100, "endTime": "2023-01-01T00:00:00Z"})
+    path = tmp_path / "opaque_trace.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    profile = load_trace_profile(path)
+
+    dag = get_workload("wide_branch")
+    probabilities = calibrate_branch_probabilities(profile, dag)
+    mapping = probabilities["f1"]
+    assert mapping == {"f2": 0.4, "f3": 0.3, "f4": 0.2, "f5": 0.1}
+
+    deep = get_workload("deep_mixed")
+    deep_mapping = calibrate_branch_probabilities(profile, deep)["f1"]
+    assert abs(sum(deep_mapping.values()) - 1.0) < 1e-9
+    # deep_mixed has two successors, so the top-2 trace functions are used.
+    assert abs(deep_mapping["f2"] - 40.0 / 70.0) < 1e-9
+    assert abs(deep_mapping["f3"] - 30.0 / 70.0) < 1e-9
+
+
+def test_controller_reads_per_dag_trace_calibration(tmp_path):
+    from mint.controller import MintController
+
+    dag = get_workload("deep_mixed")
+    config = {
+        "aws": {"lambda_functions": {node: f"mint-{node}" for node in dag.nodes}},
+        "experiment": {
+            "baseline": "no_warmup",
+            "warmup_budget": 2,
+            "output_dir": str(tmp_path / "out"),
+            "trace_calibration": {
+                "branch_probabilities": {
+                    "deep_mixed": {"f1": {"f2": 0.9, "f3": 0.1}},
+                    "wide_branch": {"f1": {"f2": 0.25, "f3": 0.25, "f4": 0.25, "f5": 0.25}},
+                }
+            },
+        },
+        "platform": {"default_retention_sec": 300, "default_cold_start_ms": 800},
+        "planner": {"type": "heuristic"},
+    }
+    controller = MintController(config, dag=dag, baseline="no_warmup", dry_run=True)
+    probabilities = controller._profile_call_probability()
+    assert probabilities["f2"] == 0.9
+    assert probabilities["f3"] == 0.1
+    assert probabilities["f6"] == 1.0
+
+
+def test_apply_trace_calibration_cli_writes_calibrated_config(tmp_path):
+    rows = []
+    counts = {"func_a": 40, "func_b": 30, "func_c": 20, "func_d": 10}
+    for function, count in counts.items():
+        for _ in range(count):
+            rows.append({"function": function, "durationMs": 120, "endTime": "2023-01-01T00:00:00Z"})
+    trace_path = tmp_path / "trace.csv"
+    pd.DataFrame(rows).to_csv(trace_path, index=False)
+
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(
+        "aws:\n  lambda_functions:\n    f1: mint-f1\n    f2: mint-f2\n"
+        "experiment:\n  dag: wide_branch\n  dry_run: false\n"
+        "planner:\n  type: markov\nplatform:\n  default_retention_sec: 300\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "tracecal.yaml"
+    rc = apply_trace_calibration_cli.main(
+        [
+            "--trace",
+            str(trace_path),
+            "--config",
+            str(config_path),
+            "--output",
+            str(output_path),
+        ]
+    )
+    assert rc == 0
+    assert output_path.exists()
+    import yaml
+
+    calibrated = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+    branch_probabilities = calibrated["experiment"]["trace_calibration"]["branch_probabilities"]
+    assert set(branch_probabilities) == {"wide_branch", "deep_mixed"}
+    assert branch_probabilities["wide_branch"]["f1"] == {
+        "f2": 0.4,
+        "f3": 0.3,
+        "f4": 0.2,
+        "f5": 0.1,
+    }
+    # The Markov multi-branch consumer gets the flat wide_branch map.
+    assert calibrated["planner"]["branch_probabilities"] == {
+        "f2": 0.4,
+        "f3": 0.3,
+        "f4": 0.2,
+        "f5": 0.1,
+    }
 
 
 def test_bootstrap_ci_single_seed_is_identity():

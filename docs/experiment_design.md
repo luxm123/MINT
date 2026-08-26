@@ -163,11 +163,27 @@ fixed baselines are also reported separately so no post-hoc cherry-picking is
 hidden.
 
 The synthetic workloads can be calibrated from the public Microsoft Azure
-Functions dataset (`scripts/download_azure_trace.py` + `mint/trace_profile.py`):
-branch probabilities come from observed call counts, stage spacing from
-inter-arrival time, warm duration from the duration median, and the cold-start
-model from observed memory.  The source is recorded in
-`experiment.trace_calibration.source` for reproducibility.
+Functions dataset.  One command downloads a slice, the second writes a
+calibrated config without touching the original:
+
+```bash
+python scripts/download_azure_trace.py --output-dir data/azure_trace --days 1 2
+python scripts/apply_trace_calibration.py \
+  --trace data/azure_trace/function_benchmark_data_1.csv \
+  --config configs/mint_aws_real.yaml \
+  --output configs/mint_aws_real_tracecal.yaml
+```
+
+Calibrated parameters: stage spacing from inter-arrival time, warm duration
+from the duration median, and the cold-start model from observed memory.
+Branch probabilities use a deterministic documented convention: because
+production traces identify functions by opaque names, the top-k most-called
+trace functions are mapped to the DAG's branch successors by frequency rank,
+preserving the trace's call-frequency skew (`branch_mapping` in
+`experiment.trace_calibration` records whether rank fallback was used).  The
+trace source is recorded in `experiment.trace_calibration.source` for
+reproducibility.  Run the core matrix with the calibrated config via
+`bash scripts/run_core_matrix.sh --real configs/mint_aws_real_tracecal.yaml`.
 
 The optional `mixed` workload adds branch choice plus downstream convergence (`f1 -> f2 or f3 -> f4 -> f5`). It is intended to stress branch, join, and downstream timing interaction while preserving the original four workloads for comparability.
 

@@ -1912,9 +1912,18 @@ class MintController:
         branch_probabilities = calibrated.get("branch_probabilities", {})
         if branch_probabilities:
             probabilities = {node: 1.0 for node in self.dag.nodes}
-            for _decision_node, mapping in branch_probabilities.items():
+            dag_branches = branch_probabilities.get(self.dag.name)
+            if not (
+                dag_branches
+                and all(isinstance(value, dict) for value in dag_branches.values())
+            ):
+                # Legacy flat format {decision_node: {target: probability}}.
+                dag_branches = branch_probabilities
+            for _decision_node, mapping in dag_branches.items():
                 for target, probability in mapping.items():
-                    if target in probabilities:
+                    if target in probabilities and isinstance(
+                        probability, (int, float)
+                    ):
                         probabilities[target] = float(probability)
             return probabilities
         probabilities = {node: 1.0 for node in self.dag.nodes}
