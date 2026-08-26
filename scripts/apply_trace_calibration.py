@@ -40,6 +40,10 @@ from typing import Any
 
 import yaml
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from mint.trace_profile import (
     apply_trace_calibration,
     calibrate_branch_probabilities,
@@ -68,7 +72,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--config", required=True, help="Source experiment YAML.")
-    parser.add_argument("--output", required=True, help="Output calibrated YAML.")
+    parser.add_argument(
+        "--output",
+        default="configs/mint_aws_real_tracecal.yaml",
+        help="Output calibrated YAML (default: configs/mint_aws_real_tracecal.yaml).",
+    )
     parser.add_argument(
         "--dags",
         nargs="+",

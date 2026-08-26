@@ -465,7 +465,11 @@ def test_warmup_overrun_is_counted_in_end_to_end_latency(tmp_path, monkeypatch):
 
 def test_default_arrival_preserves_configured_warmup_lead(tmp_path):
     config = _config(tmp_path, "mint_markov_full")
-    config["experiment"]["warmup_lead_sec"] = 0.03
+    # Margin is a test-harness parameter, not experiment design: the invariant
+    # is that warmups complete before the planned arrival.  30 ms is too tight
+    # on Windows under full-suite CPU contention (interpreter overhead between
+    # warmup start and invoke completion), so keep a comfortable 200 ms.
+    config["experiment"]["warmup_lead_sec"] = 0.2
     controller = MintController(
         config,
         dag=get_workload("chain"),

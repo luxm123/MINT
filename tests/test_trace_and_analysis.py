@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -239,6 +241,22 @@ def test_download_azure_trace_dry_run_prints_github_url(tmp_path, capsys):
     assert "github.com/Azure/AzurePublicDataset/releases/download" in output
     assert "invocations_per_function_md.anon.d01.csv" in output
     assert "app_memory_percentiles.anon.d02.csv" in output
+
+
+def test_apply_trace_calibration_cli_runs_as_script_from_repo_root():
+    """python scripts/apply_trace_calibration.py must import the mint package."""
+    repo_root = Path(__file__).resolve().parents[1]
+    script = repo_root / "scripts" / "apply_trace_calibration.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--trace-dir" in result.stdout
+    assert "--output" in result.stdout
 
 
 def test_controller_reads_per_dag_trace_calibration(tmp_path):
