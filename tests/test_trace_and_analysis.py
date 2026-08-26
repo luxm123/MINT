@@ -9,10 +9,12 @@ from mint.orion import OrionProfile, build_bundles, decide
 from mint.trace_profile import (
     apply_trace_calibration,
     calibrate_branch_probabilities,
+    load_aggregate_profile,
     load_trace_profile,
 )
 from mint.workloads import get_workload
 from scripts import apply_trace_calibration as apply_trace_calibration_cli
+from scripts import download_azure_trace as download_azure_trace_cli
 from scripts.analyze_cost_latency import build_cost_latency, pareto_front
 from scripts.analyze_seed_statistics import bootstrap_ci, build_dominance_table, build_statistics_table
 
@@ -93,6 +95,150 @@ def test_calibrate_rank_fallback_maps_top_functions_by_frequency(tmp_path):
     # deep_mixed has two successors, so the top-2 trace functions are used.
     assert abs(deep_mapping["f2"] - 40.0 / 70.0) < 1e-9
     assert abs(deep_mapping["f3"] - 30.0 / 70.0) < 1e-9
+
+
+def _write_aggregate_trace(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Write three CSVs matching the official AzureFunctionsDataset2019 schema."""
+    invocations = pd.DataFrame(
+        {
+            "HashOwner": ["owner1", "owner1"],
+            "HashApp": ["appA", "appB"],
+            "HashFunction": ["f1", "f2"],
+            "Trigger": ["http", "timer"],
+            "1": [10, 30],
+            "2": [20, 60],
+            "3": [30, 90],
+        }
+    )
+    durations = pd.DataFrame(
+        {
+            "HashOwner": ["owner1", "owner1"],
+            "HashApp": ["appA", "appB"],
+            "HashFunction": ["f1", "f2"],
+            "Average": [100, 200],
+            "Count": [60, 180],
+            "Minimum": [50, 100],
+            "Maximum": [500, 900],
+            "percentile_Average_1": [80, 150],
+            "percentile_Average_25": [90, 170],
+            "percentile_Average_50": [100, 200],
+            "percentile_Average_75": [120, 240],
+            "percentile_Average_99": [300, 600],
+            "percentile_Average_100": [500, 900],
+        }
+    )
+    memory = pd.DataFrame(
+        {
+            "HashOwner": ["owner1", "owner1"],
+            "HashApp": ["appA", "appB"],
+            "SampleCount": [1440, 1440],
+            "AverageAllocatedMb": [256, 512],
+            "AverageAllocatedMb_pct1": [128, 256],
+            "AverageAllocatedMb_pct5": [128, 256],
+            "AverageAllocatedMb_pct25": [192, 384],
+            "AverageAllocatedMb_pct50": [256, 512],
+            "AverageAllocatedMb_pct75": [320, 640],
+            "AverageAllocatedMb_pct95": [512, 1024],
+            "AverageAllocatedMb_pct99": [640, 1280],
+            "AverageAllocatedMb_pct100": [1024, 2048],
+        }
+    )
+    invocations_path = tmp_path / "invocations_per_function_md.anon.d01.csv"
+    durations_path = tmp_path / "function_durations_percentiles.anon.d01.csv"
+    memory_path = tmp_path / "app_memory_percentiles.anon.d01.csv"
+    invocations.to_csv(invocations_path, index=False)
+    durations.to_csv(durations_path, index=False)
+    memory.to_csv(memory_path, index=False)
+    return invocations_path, durations_path, memory_path
+
+
+def test_load_aggregate_profile_official_schema(tmp_path):
+    invocations, durations, memory = _write_aggregate_trace(tmp_path)
+    profile = load_aggregate_profile(
+        invocations, durations, memory, source="azure-2019-d01"
+    )
+    assert profile.source == "azure-2019-d01"
+    assert profile.total_invocations == 240
+    assert profile.call_counts == {"appA:f1": 60.0, "appB:f2": 180.0}
+    assert profile.duration_ms_quantiles == {
+        "appA:f1": (80.0, 100.0, 300.0),
+        "appB:f2": (150.0, 200.0, 600.0),
+    }
+    p10, p50, p90 = profile.memory_mb_quantiles
+    assert p50 == 384.0
+    assert p10 < p50 < p90
+    assert profile.interarrival_sec_quantiles is not None
+    assert profile.interarrival_sec_quantiles[1] == 0.75  # 60/80 per-minute median
+    assert profile.cold_start_rate is None
+
+
+def test_load_aggregate_profile_memory_optional(tmp_path):
+    invocations, durations, _memory = _write_aggregate_trace(tmp_path)
+    profile = load_aggregate_profile(invocations, durations, None)
+    assert profile.memory_mb_quantiles == (128.0, 128.0, 128.0)
+    assert profile.total_invocations == 240
+
+
+def test_apply_trace_calibration_cli_trace_dir(tmp_path, capsys):
+    trace_dir = tmp_path / "trace"
+    trace_dir.mkdir()
+    invocations, durations, memory = _write_aggregate_trace(trace_dir)
+    config_path = tmp_path / "base.yaml"
+    config_path.write_text(
+        "aws:\n  lambda_functions:\n    f1: mint-f1\n    f2: mint-f2\n"
+        "experiment:\n  dag: wide_branch\n  dry_run: false\n"
+        "planner:\n  type: markov\nplatform:\n  default_retention_sec: 300\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "tracecal.yaml"
+    rc = apply_trace_calibration_cli.main(
+        [
+            "--trace-dir",
+            str(trace_dir),
+            "--config",
+            str(config_path),
+            "--output",
+            str(output_path),
+        ]
+    )
+    assert rc == 0
+    assert output_path.exists()
+    assert str(invocations) in capsys.readouterr().out
+
+    import yaml
+
+    calibrated = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+    branch_probabilities = calibrated["experiment"]["trace_calibration"][
+        "branch_probabilities"
+    ]
+    assert set(branch_probabilities) == {"wide_branch", "deep_mixed"}
+    # Rank fallback: appB:f2 (180) and appA:f1 (60) are the top-2 functions.
+    assert branch_probabilities["wide_branch"]["f1"] == {
+        "f2": 0.75,
+        "f3": 0.25,
+    }
+    assert abs(calibrated["planner"]["branch_probability_left"] - 0.75) < 1e-9
+    assert calibrated["platform"]["default_warm_duration_ms"] == 150.0
+    assert calibrated["platform"]["default_cold_start_ms"] == 442.0
+    assert calibrated["experiment"]["stage_gap_sec"] == 0.75
+
+
+def test_download_azure_trace_dry_run_prints_github_url(tmp_path, capsys):
+    rc = download_azure_trace_cli.main(
+        [
+            "--output-dir",
+            str(tmp_path),
+            "--days",
+            "1",
+            "2",
+            "--dry-run",
+        ]
+    )
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "github.com/Azure/AzurePublicDataset/releases/download" in output
+    assert "invocations_per_function_md.anon.d01.csv" in output
+    assert "app_memory_percentiles.anon.d02.csv" in output
 
 
 def test_controller_reads_per_dag_trace_calibration(tmp_path):

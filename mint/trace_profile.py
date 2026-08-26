@@ -127,6 +127,117 @@ def load_trace_profile(path: str | Path, source: str = "") -> TraceProfile:
     )
 
 
+def load_aggregate_profile(
+    invocations_csv: str | Path,
+    durations_csv: str | Path,
+    memory_csv: str | Path | None = None,
+    source: str = "",
+) -> TraceProfile:
+    """Load the official Azure Functions 2019 aggregate trace (ATC'20).
+
+    The AzureFunctionsDataset2019 files are aggregate, not per-invocation:
+    per-function per-minute invocation counts, per-function weighted duration
+    percentiles, and per-application memory percentiles.  This loader turns
+    them into the same TraceProfile used by the per-invocation path so
+    apply_trace_calibration can calibrate call counts, warm duration, the
+    cold-start model, and an approximate per-minute interarrival estimate.
+
+    File schemas (documented in AzureFunctionsDataset2019.md):
+      invocations_per_function_md.anon.dNN.csv:
+          HashOwner, HashApp, HashFunction, Trigger, 1..1440 (per-minute counts)
+      function_durations_percentiles.anon.dNN.csv:
+          HashOwner, HashApp, HashFunction, Average, Count, Minimum, Maximum,
+          percentile_Average_{0,1,25,50,75,99,100}
+      app_memory_percentiles.anon.dNN.csv:
+          HashOwner, HashApp, SampleCount, AverageAllocatedMb,
+          AverageAllocatedMb_pct{1,5,25,50,75,95,99,100}
+
+    memory_csv is optional (the official archive has memory files only for
+    days 1..12); when omitted the default 128 MiB profile is used.
+    """
+    invocations = pd.read_csv(invocations_csv)
+    invocations.columns = [str(column).strip().lower() for column in invocations.columns]
+    durations = pd.read_csv(durations_csv)
+    durations.columns = [str(column).strip().lower() for column in durations.columns]
+
+    def _function_id(row: pd.Series) -> str:
+        app = str(row.get("hashapp", ""))
+        function = str(row.get("hashfunction", ""))
+        return f"{app}:{function}"
+
+    minute_columns = [
+        column
+        for column in invocations.columns
+        if column not in {"hashowner", "hashapp", "hashfunction", "trigger"}
+    ]
+    if not minute_columns:
+        raise ValueError("aggregate invocations CSV has no per-minute count columns")
+    invocations["_total"] = pd.to_numeric(
+        invocations[minute_columns].apply(pd.to_numeric, errors="coerce").sum(axis=1),
+        errors="coerce",
+    ).fillna(0.0)
+    invocations["_function_id"] = invocations.apply(_function_id, axis=1)
+    per_function = invocations.groupby("_function_id")["_total"].sum()
+    call_counts = {name: float(value) for name, value in per_function.items()}
+    total_invocations = int(per_function.sum())
+
+    # Approximate interarrival from per-minute invocation totals: within a
+    # minute with T invocations the expected spacing is 60/T seconds.
+    per_minute = invocations[minute_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).sum(axis=0)
+    per_minute = per_minute[per_minute > 0]
+    interarrival_sec = 60.0 / per_minute
+    interarrival_quantiles = (
+        tuple(float(value) for value in np.percentile(interarrival_sec, [10, 50, 90]))
+        if not interarrival_sec.empty
+        else None
+    )
+
+    duration_quantiles: dict[str, tuple[float, float, float]] = {}
+    if "hashfunction" in durations.columns and "percentile_average_1" in durations.columns:
+        durations["_function_id"] = durations.apply(_function_id, axis=1)
+        for function_id, group in durations.groupby("_function_id"):
+            values = (
+                pd.to_numeric(group["percentile_average_1"], errors="coerce"),
+                pd.to_numeric(group["percentile_average_50"], errors="coerce"),
+                pd.to_numeric(group["percentile_average_99"], errors="coerce"),
+            )
+            if any(series.dropna().empty for series in values):
+                continue
+            duration_quantiles[function_id] = (
+                float(values[0].median()),
+                float(values[1].median()),
+                float(values[2].median()),
+            )
+
+    memory_quantiles = (128.0, 128.0, 128.0)
+    if memory_csv is not None:
+        memory = pd.read_csv(memory_csv)
+        memory.columns = [str(column).strip().lower() for column in memory.columns]
+        memory_p50 = "averageallocatedmb_pct50"
+        if memory_p50 in memory.columns:
+            memory_values = pd.to_numeric(memory[memory_p50], errors="coerce").dropna()
+            memory_quantiles = (
+                tuple(
+                    float(value)
+                    for value in np.percentile(memory_values, [10, 50, 90])
+                )
+                if not memory_values.empty
+                else (128.0, 128.0, 128.0)
+            )
+
+    return TraceProfile(
+        source=source or str(invocations_csv),
+        total_invocations=total_invocations,
+        call_counts=call_counts,
+        duration_ms_quantiles=duration_quantiles,
+        memory_mb_quantiles=memory_quantiles,
+        interarrival_sec_quantiles=interarrival_quantiles,
+        cold_start_rate=None,
+    )
+
+
 def calibrate_branch_probabilities(
     profile: TraceProfile,
     dag: WorkflowDAG,
