@@ -169,11 +169,16 @@ calibrated config without touching the original:
 ```bash
 python scripts/download_azure_trace.py --output-dir data/azure_trace --days 1 2
 python scripts/apply_trace_calibration.py \
-  --trace data/azure_trace/function_benchmark_data_1.csv \
+  --trace-dir data/azure_trace \
   --config configs/mint_aws_real.yaml \
   --output configs/mint_aws_real_tracecal.yaml
 ```
 
+The downloader fetches the official Azure Functions 2019 dataset from GitHub
+Releases (the archive is not bundled in the repo), extracts the aggregate
+per-day CSVs, and writes `download_manifest.json` recording the source URL,
+days, and any memory-file fallback for days without published memory data.
+`apply_trace_calibration.py --trace-dir` auto-detects the three CSVs.
 Calibrated parameters: stage spacing from inter-arrival time, warm duration
 from the duration median, and the cold-start model from observed memory.
 Branch probabilities use a deterministic documented convention: because

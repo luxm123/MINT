@@ -260,24 +260,22 @@ representative of real serverless traffic, download a slice of the public
 Microsoft Azure Functions dataset and calibrate the workload parameters:
 
 ```bash
-python scripts/download_azure_trace.py --output-dir traces/azure --days 1 2 --dry-run
-# then without --dry-run on a machine with network access
-python - <<'PY'
-from mint.trace_profile import load_trace_profile, apply_trace_calibration
-from mint.workloads import get_workload
-from mint.utils import load_yaml
-
-profile = load_trace_profile("traces/azure/function_benchmark_data_1.csv")
-config = load_yaml("configs/mint_aws.yaml")
-apply_trace_calibration(config, profile, get_workload("wide_branch"))
-PY
+python scripts/download_azure_trace.py --output-dir data/azure_trace --days 1
+python scripts/apply_trace_calibration.py \
+  --trace-dir data/azure_trace \
+  --config configs/mint_aws_real.yaml \
+  --output configs/mint_aws_real_tracecal.yaml
 ```
 
-Calibration sets branch probabilities from observed call counts, stage spacing
-from inter-arrival time, warm duration from the duration median, and the
-cold-start model from observed memory.  The same matrix protocol then runs on
-the trace-calibrated parameters; the trace source is recorded in the config
-under `experiment.trace_calibration.source`.
+The downloader fetches the official Azure Functions 2019 dataset from GitHub
+Releases (Azure/AzurePublicDataset), which works on networks where the legacy
+blob-storage hostname does not resolve, and extracts the aggregate per-day CSVs
+(invocation counts, duration percentiles, memory percentiles).  Calibration
+sets branch probabilities from observed call counts, stage spacing from
+inter-arrival time, warm duration from the duration median, and the cold-start
+model from observed memory.  The same matrix protocol then runs on the
+trace-calibrated parameters; the trace source is recorded in the config under
+`experiment.trace_calibration.source`.
 
 ## Delay-Shift Experiment
 
