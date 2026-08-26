@@ -71,7 +71,24 @@ The main AWS benchmark is a representative Serverless DAG workflow benchmark rat
 
 For the paper core comparison, use the adaptive stress benchmark because the basic `chain`/`fanout`/`branch`/`join` DAGs can make fixed prewarming baselines choose highly overlapping warmup targets. The adaptive stress benchmark uses `wide_branch` and `deep_mixed` with `--profile-mismatch`, fixed `--branch-seed`, `--timing-jitter-ms 800`, and budgets `1 2 3`. It is designed to test MINT under path uncertainty, profile mismatch, timing jitter, and budget pressure.
 
-The final adaptive stress comparison reports `No warmup`, `Best-fixed`, `Path-aware greedy`, `MINT`, and `Oracle`. `Best-fixed` is computed during analysis by selecting the lowest-P95 result for each workload-budget pair among Periodic keep-warm, DAG-gain fixed, and Fixed look-ahead. `Path-aware greedy` is a simple online baseline that uses the realized path and hot/cold state, filters off-path and already-hot candidates, and warms the highest-gain candidates within the same budget. `Oracle` is an ideal path-aware upper bound with advance knowledge of the realized path; it is not a deployable method and should not be treated as a fair baseline. Fixed look-ahead is inspired by DAG-aware right-prewarming, but it is not a complete ORION reproduction.
+The confirmed paper core comparison reports five rows:
+
+| Row | Method | Role |
+|---|---|---|
+| 1 | `mint_markov_full` (MINT) | proposed method |
+| 2 | `orion_full` (ORION, OSDI'22) | strongest DAG-aware prewarming baseline, scheduling-layer reproduction of the open-sourced system |
+| 3 | `faascache` (FaasCache, ASPLOS'21) | strongest budgeted keep-alive baseline: Greedy-Dual-Size-Frequency cache where B is the number of proactive warmup slots |
+| 4 | `xanadu_full` (Xanadu, Middleware'20) | strongest cascading-cold-start baseline: most-likely-path detection with just-in-time speculative provisioning |
+| 5 | `no_warmup` | cold-start reference row (not a deployable baseline) |
+
+Every baseline runs under the same budget B (1/2/3), the same
+`wide_branch`/`deep_mixed` workloads, the same profile mismatch and timing
+jitter, the same seeds, and the same trace-calibrated parameters (Azure
+Functions public trace: branch probabilities, stage gaps, warm duration,
+cold-start model). The remaining strategies (`periodic_keepwarm`,
+`static_dag`, `orion_like`, `path_aware_greedy`, `xanadu_like`, `oracle_path`,
+`provisioned_concurrency`, and the MINT ablations) stay available in the code
+as appendix/ablation material, not core comparisons.
 
 Recommended adaptive stress dry-run:
 
@@ -79,9 +96,10 @@ Recommended adaptive stress dry-run:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
+  --baselines no_warmup orion_full faascache xanadu_full mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
+  --seeds 42 43 44 45 46 \
   --cooldown-sec 0 \
   --profile-mismatch \
   --timing-jitter-ms 800 \
@@ -97,9 +115,10 @@ Recommended EC2 real run:
 nohup python scripts/run_experiment_matrix.py \
   --config configs/mint_aws_real.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
+  --baselines no_warmup orion_full faascache xanadu_full mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
+  --seeds 42 43 44 45 46 \
   --cooldown-sec 120 \
   --profile-mismatch \
   --timing-jitter-ms 800 \
@@ -109,6 +128,25 @@ nohup python scripts/run_experiment_matrix.py \
   --output-root results/aws_adaptive_stress_main \
   > adaptive_stress_main.log 2>&1 &
 ```
+
+Dynamic MINT budget note: the runtime intent-maintenance implementation keeps
+one immediate warmup slot plus a general multi-pending-intent queue, so
+`mint_markov_full` supports `warmup_budget` 1/2/3 on branch DAGs
+(`wide_branch`, `deep_mixed`, and the ablation workloads). The two
+intent-maintenance ablations (`mint_markov_no_cancel` / `mint_markov_cancel_only`)
+remain defined only for B=2, and the `adaptive_branch` workload keeps its
+explicit B=2/initial=1 contract. The matrix runner records any genuinely
+unsupported cells in `skipped_runs.jsonl` and the manifest lists
+`skipped_count`; the paper core matrix (wide_branch/deep_mixed x 5 rows
+x B=1/2/3) is expected to complete with zero skips and is checked by
+`scripts/audit_adaptive_stress_results.py` (or `--audit` on the matrix
+runner).
+
+Dry-run scope note: dry-run mode is a pipeline and mechanism check. It
+simulates cold/warm invocation latencies as recorded event fields but does not
+sleep cold-start wall-clock time, so measured dry-run end-to-end latency mostly
+reflects warmup overhead and must not be used as performance evidence. Paper
+latency claims should come from real AWS runs (measured wall-clock latency).
 
 Quick dry-run validation:
 
@@ -173,15 +211,73 @@ Additional credibility checks:
 
 ```bash
 python scripts/analyze_baseline_overlap.py \
-  --results-dir results/aws_baseline_main_20260606_061220 \
-  --output-dir results/aws_baseline_main_20260606_061220/overlap
+  --results-dir results/aws_baseline_main_v2_20260606_114412 \
+  --output-dir results/aws_baseline_main_v2_20260606_114412/overlap
 
 python scripts/prepare_pareto_data.py \
-  --matrix-csv results/aws_baseline_main_20260606_061220/summary_matrix.csv \
-  --output-dir results/aws_baseline_main_20260606_061220/pareto
+  --matrix-csv results/aws_baseline_main_v2_20260606_114412/summary_matrix.csv \
+  --output-dir results/aws_baseline_main_v2_20260606_114412/pareto
 ```
 
 Overlap analysis checks whether baseline warmup target sets are nearly identical, and also writes sequence, frequency-vector, and timing-bucket overlap tables. High target-set overlap alone does not prove two baselines are equivalent; if target, frequency, timing, and action summaries are all high-overlap, the small DAG is probably not separating those strategies well. Pareto data supports cost-latency plots using `total_warmup` as cost and average or P95 latency as the performance axis; `latency_per_warmup` is retained only as a diagnostic ratio, not the primary comparison rule.
+
+## Seed Statistics and Cost-Latency
+
+The matrix runner accepts `--seeds 42 43 44 45 46`; each (dag, baseline, budget, seed)
+cell runs `--repetitions` workflow samples.  Paper analysis should aggregate
+over seeds with bootstrap confidence intervals rather than reporting a single
+seed's point estimate:
+
+```bash
+python scripts/analyze_seed_statistics.py \
+  --matrix-csv results/aws_adaptive_stress_main/summary_matrix.csv \
+  --output-dir results/aws_adaptive_stress_main/seed_stats \
+  --bootstrap-iters 2000
+```
+
+It writes `seed_statistics.csv` (mean + 95% CI per dag/baseline/budget/metric)
+and `pairwise_dominance.csv` (bootstrap probability that MINT P95 is lower than
+each other method, with mean difference and CI).  Cost-latency uses an explicit
+pricing model: warmup invocations cost `--invocation-price-usd` each, while
+Provisioned Concurrency costs `--provisioned-price-usd-per-slot-sec` per
+provisioned slot-second on a separate axis:
+
+```bash
+python scripts/analyze_cost_latency.py \
+  --matrix-csv results/aws_adaptive_stress_main/summary_matrix.csv \
+  --output-dir results/aws_adaptive_stress_main/cost_latency
+```
+
+`Best-fixed` remains an analysis-stage envelope: it is the pre-registered,
+deterministic rule "minimum P95 per (dag, budget) among periodic_keepwarm /
+static_dag / orion_like", and paper tables also report those three fixed
+baselines separately.
+
+## Trace-Calibrated Workloads
+
+The default workloads are synthetic DAG microbenchmarks.  To make them
+representative of real serverless traffic, download a slice of the public
+Microsoft Azure Functions dataset and calibrate the workload parameters:
+
+```bash
+python scripts/download_azure_trace.py --output-dir traces/azure --days 1 2 --dry-run
+# then without --dry-run on a machine with network access
+python - <<'PY'
+from mint.trace_profile import load_trace_profile, apply_trace_calibration
+from mint.workloads import get_workload
+from mint.utils import load_yaml
+
+profile = load_trace_profile("traces/azure/function_benchmark_data_1.csv")
+config = load_yaml("configs/mint_aws.yaml")
+apply_trace_calibration(config, profile, get_workload("wide_branch"))
+PY
+```
+
+Calibration sets branch probabilities from observed call counts, stage spacing
+from inter-arrival time, warm duration from the duration median, and the
+cold-start model from observed memory.  The same matrix protocol then runs on
+the trace-calibrated parameters; the trace source is recorded in the config
+under `experiment.trace_calibration.source`.
 
 ## Delay-Shift Experiment
 
@@ -216,17 +312,47 @@ Supported baselines are:
 - `static_dag`
 - `static_dag_unlimited`
 - `orion_like`
+- `orion_full`
+- `faascache`
+- `xanadu_full`
+- `xanadu_like`
+- `path_aware_greedy`
+- `oracle_path`
 - `mint_offline`
 - `mint_offline_unlimited`
 - `mint_full`
 - `mint_markov_offline`
 - `mint_markov_full`
+- `provisioned_concurrency`
 
 `mint_full` uses offline intents plus the runtime scheduler. For fair comparison, `static_dag`, `mint_offline`, and `mint_full` all obey `experiment.warmup_budget`. The `_unlimited` variants are available only when you intentionally want an unbounded static/offline comparison.
 
 `mint_offline` and `mint_full` preserve the original heuristic planner behavior. `mint_markov_offline` uses the Markov policy analyzer without runtime adaptation, while `mint_markov_full` combines Markov-generated intents with runtime-adaptive scheduling.
 
 `periodic_keepwarm` is an industrial keep-warm baseline: it does not use DAG structure, stage order, or branch/path information, and selects functions in a round-robin keep-warm order while respecting `warmup_budget`. `static_dag` uses a fixed DAG-aware offline order and does not do runtime cancel, replace, or delay. `orion_like` is an ORION-style DAG-aware right-prewarming approximation: it uses DAG profile, stage order, expected function start time, and fixed look-ahead prewarming for downstream functions. It does not implement ORION right-sizing, bundling, or a complete ORION reproduction; describe it only as a DAG-aware fixed right-prewarming baseline.
+
+`orion_full` is the full ORION reproduction at the scheduling layer: it maintains a container cache driven by exponentially-decayed historical invocation counts, performs right-sizing by choosing a memory tier that maximizes value/cost for each function or bundle, and bundles functions on the same DAG path so one warmup call covers the whole chain. In dry-run it models all three mechanisms; a fully faithful real AWS run additionally requires per-memory-tier deployments and composed (bundled) Lambda functions.
+
+`faascache` is the FaasCache (ASPLOS'21) Greedy-Dual-Size-Frequency keep-alive
+cache at the scheduling layer: the budget B bounds the number of proactive
+warmup slots, values are `cost * freq / size + L` (cold-start latency saved,
+invocation frequency with optional recency decay, container memory footprint,
+and the GDS aging factor equal to the last evicted value), and warmups fill
+free slots or replace the lowest-value resident. Real invocations update
+frequency and populate the cache exactly like accesses in the original
+system. `xanadu_full` is the Xanadu (Middleware'20) most-likely-path
+just-in-time prewarming reproduction: it derives the MLP from the
+trace-calibrated and learned branch probabilities, and spends the B warmup
+slots on the earliest-needed MLP members first, never warming the entry
+function (the workflow trigger) or off-MLP functions.
+
+`path_aware_greedy` and `xanadu_like` are the older approximation rows kept
+for appendix comparisons: they warm the highest expected-gain candidates
+under the same budget without MINT's Markov policy and without a faithful
+Xanadu MLP/JIT reproduction. `oracle_path` is an ideal upper bound with
+advance knowledge of the realized path; it is not a deployable baseline.
+
+`provisioned_concurrency` models AWS Lambda Provisioned Concurrency: the budget B is spent on pre-provisioned slots for the highest-value functions, which are always warm, and cost is accounted on a separate axis (`provisioned_slots_total` x `provisioned_duration_sec_total`) rather than warmup invocation count. Use `scripts/manage_provisioned_concurrency.py` to configure/remove real provisioned concurrency before and after an AWS matrix; the experiment runner never calls AWS provisioning itself.
 
 The optional `mixed` workload combines branch choice, join-style downstream convergence, and f4/f5 downstream timing. It is intended for stronger runtime-adaptation evaluation without changing the original `chain`, `fanout`, `branch`, and `join` workloads.
 

@@ -21,12 +21,15 @@ from mint.events import (
     WarmupEvent,
     WorkflowRunSummary,
 )
+from mint.faascache import FaasCacheProfile, GdsfCache
 from mint.intent_lifecycle import IntentBudgetLedger, IntentState, TransitionResult
 from mint.intent_planner import WarmupIntent, plan_intents
 from mint.metrics import compute_summary
+from mint.orion import OrionBundle, OrionProfile, build_bundles, decide as orion_decide
 from mint.scheduler import WarmupAction, schedule_intents
 from mint.utils import append_jsonl, ensure_dir, monotonic_sec, new_id, utc_now_iso
 from mint.workloads import WorkflowDAG, get_workload
+from mint.xanadu import most_likely_path
 
 
 SUPPORTED_BASELINES = {
@@ -37,9 +40,13 @@ SUPPORTED_BASELINES = {
     "static_dag",
     "static_dag_unlimited",
     "orion_like",
+    "orion_full",
+    "faascache",
+    "xanadu_full",
     "xanadu_like",
     "path_aware_greedy",
     "oracle_path",
+    "provisioned_concurrency",
     "mint_offline",
     "mint_offline_unlimited",
     "mint_full",
@@ -110,12 +117,6 @@ class MintController:
             "mint_markov_cancel_only",
             "mint_markov_full",
         } and self.dag.branch_rules:
-            budget = int(exp_cfg.get("warmup_budget", 1))
-            if budget > 2:
-                raise ValueError(
-                    "the current runtime intent-maintenance implementation has "
-                    f"one immediate and one pending slot (maximum B=2); got B={budget}"
-                )
             if len(self.dag.branch_rules) > 1:
                 raise ValueError(
                     "the current runtime intent-maintenance implementation supports "
@@ -134,14 +135,36 @@ class MintController:
         self._hot_until: dict[str, float] = {}
         self._executed_warmups_by_run: dict[str, list[str]] = {}
         self._intent_ledgers_by_run: dict[str, IntentBudgetLedger] = {}
-        self._pending_intents_by_run: dict[str, WarmupIntent] = {}
-        self._scheduled_tasks_by_run: dict[str, RuntimeWarmupTask] = {}
+        self._pending_intents_by_run: dict[str, list[WarmupIntent]] = {}
+        self._scheduled_tasks_by_run: dict[str, list[RuntimeWarmupTask]] = {}
         self._warmup_failures_by_run: dict[str, int] = {}
         self._scheduler_failures_by_run: dict[str, int] = {}
         self._last_environment_ids: dict[str, str] = {}
         self.planner_type = self._planner_type_for_baseline()
         self._workflow_index = 0
         self.function_pool = str(exp_cfg.get("function_pool", self.baseline))
+        if self.baseline == "orion_full":
+            self._orion_bundles = build_bundles(self.dag)
+            self._orion_ema: dict[str, float] = {
+                node: 0.0 for node in self.dag.nodes
+            }
+            self._orion_warm_bundle_ids: set[str] = set()
+            self._orion_memory_by_bundle: dict[str, int] = {}
+            self._orion_pending_bundles: dict[str, tuple[OrionBundle, int]] = {}
+        else:
+            self._orion_bundles = []
+            self._orion_ema = {}
+            self._orion_warm_bundle_ids = set()
+            self._orion_memory_by_bundle = {}
+            self._orion_pending_bundles = {}
+        if self.baseline == "provisioned_concurrency":
+            self._provisioned_nodes = set(self._provisioning_plan())
+            self._provisioned_slots = len(self._provisioned_nodes)
+            for node in self._provisioned_nodes:
+                self._hot_until[node] = float("inf")
+        else:
+            self._provisioned_nodes = set()
+            self._provisioned_slots = 0
         pools = config.get("aws", {}).get("lambda_function_pools", {})
         configured_pool = exp_cfg.get("function_pool")
         if configured_pool and configured_pool not in pools:
@@ -154,6 +177,13 @@ class MintController:
             self._branch_names(), config.get("planner", {})
         ) if self._branch_names() else None
         self._active_model_snapshot: dict[str, Any] = {}
+        if self.baseline == "faascache":
+            self._faascache = GdsfCache(
+                self._warmup_budget(), self._faascache_profile()
+            )
+            self._faascache.seed_frequencies(self._profile_call_probability())
+        else:
+            self._faascache = None
 
     def run(self, repetitions: int) -> dict[str, Any]:
         reset_each_run = bool(self.config.get("experiment", {}).get("reset_runtime_state_each_run", False))
@@ -227,7 +257,7 @@ class MintController:
             time.sleep(wait_for_warmup_sec)
 
         runtime_executor: ThreadPoolExecutor | None = None
-        runtime_pending: RuntimeWarmupTask | None = None
+        runtime_pending_tasks: list[RuntimeWarmupTask] = []
         try:
             if self.baseline != "no_warmup":
                 warmup_count += self._run_warmups(
@@ -253,11 +283,13 @@ class MintController:
             stages = self.dag.stages()
             if self._runtime_replanning_enabled():
                 runtime_executor = ThreadPoolExecutor(
-                    max_workers=2, thread_name_prefix="mint-runtime-warmup"
+                    max_workers=max(2, self._warmup_budget()),
+                    thread_name_prefix="mint-runtime-warmup",
                 )
-                pending_intent = self._pending_intents_by_run.get(run_id)
-                if pending_intent is not None:
-                    runtime_pending = self._schedule_pending_intent(
+                for pending_intent in list(
+                    self._pending_intents_by_run.get(run_id, [])
+                ):
+                    task = self._schedule_pending_intent(
                         run_id,
                         pending_intent,
                         index,
@@ -265,6 +297,8 @@ class MintController:
                         scheduled_submit_sec=workflow_start
                         + self._pending_delay_sec(pending_intent),
                     )
+                    if task is not None:
+                        runtime_pending_tasks.append(task)
         except BaseException:
             if self._runtime_replanning_enabled():
                 try:
@@ -273,9 +307,10 @@ class MintController:
                     )
                 except Exception:
                     pass
-            if runtime_pending is not None:
+            for task in list(runtime_pending_tasks):
+                runtime_pending_tasks.remove(task)
                 try:
-                    self._complete_runtime_warmup(run_id, runtime_pending)
+                    self._complete_runtime_warmup(run_id, task)
                 except Exception:
                     pass
             if runtime_executor is not None:
@@ -289,38 +324,48 @@ class MintController:
         try:
             for path_index, logical in enumerate(selected_nodes):
                 function_name = self.function_map.get(logical, logical)
-                payload = {"function_name": logical, "run_id": run_id, "invocation_type": "real", "sleep_ms": 10}
+                stage_jitter_ms = self._timing_jitter_ms(
+                    index, stages.get(logical, 0)
+                )
+                payload = {
+                    "function_name": logical,
+                    "run_id": run_id,
+                    "invocation_type": "real",
+                    "sleep_ms": max(1.0, 10.0 + stage_jitter_ms),
+                }
                 expected_branch = self._revealed_successor(logical, context)
                 if expected_branch:
                     payload["branch"] = expected_branch
                 response: dict[str, Any] = {}
                 at_demand_decision: SchedulerDecision | None = None
-                if runtime_pending and runtime_pending.intent.logical_name == logical:
-                    if runtime_pending.future.done():
-                        task = runtime_pending
-                        runtime_pending = None
+                pending_task = self._find_task_for_node(
+                    runtime_pending_tasks, logical
+                )
+                if pending_task is not None:
+                    if pending_task.future.done():
+                        runtime_pending_tasks.remove(pending_task)
                         # The worker has already completed.  Record the demand
                         # boundary after observing completion, which guarantees
                         # its invoke-end precedes this business demand.
-                        task.demand_submit_sec = monotonic_sec()
-                        self._complete_runtime_warmup(run_id, task)
+                        pending_task.demand_submit_sec = monotonic_sec()
+                        self._complete_runtime_warmup(run_id, pending_task)
                     else:
                         # Freeze the conservative demand boundary without doing
                         # file I/O before the real call.  A warmup finishing
                         # after this instant is classified as late even if the
                         # two SDK calls race within a few microseconds.
-                        runtime_pending.demand_submit_sec = monotonic_sec()
+                        pending_task.demand_submit_sec = monotonic_sec()
                         at_demand_decision = SchedulerDecision(
                             event_type="scheduler_decision",
                             run_id=run_id,
                             workflow_index=index,
-                            intent_id=runtime_pending.intent.intent_id,
-                            function_name=runtime_pending.intent.function_name,
-                            logical_name=runtime_pending.intent.logical_name,
+                            intent_id=pending_task.intent.intent_id,
+                            function_name=pending_task.intent.function_name,
+                            logical_name=pending_task.intent.logical_name,
                             action="in_flight_at_demand",
                             action_reason="warmup_not_ready_at_demand_business_continues_without_waiting",
-                            gain=runtime_pending.gain,
-                            planned_time_sec=runtime_pending.intent.planned_time_sec,
+                            gain=pending_task.gain,
+                            planned_time_sec=pending_task.intent.planned_time_sec,
                             decision_phase="runtime_at_demand",
                             model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
                             branch_probabilities=json.dumps(
@@ -394,6 +439,8 @@ class MintController:
                     observed_branch=observed.get("observed_branch", ""),
                 )
                 append_jsonl(self.events_path, event.to_dict())
+                self._observe_orion_invocation(logical)
+                self._observe_faascache_invocation(logical)
                 if expected_branch and self._runtime_replanning_enabled():
                     observed_branch = str(observed.get("observed_branch") or "")
                     if observed_branch != expected_branch:
@@ -403,7 +450,7 @@ class MintController:
                         )
                     if runtime_executor is None:
                         raise RuntimeError("runtime warmup executor was not initialized")
-                    runtime_pending = self._runtime_revise_after_branch(
+                    runtime_pending_tasks = self._runtime_revise_after_branch(
                         run_id, intents, observed_branch, index, runtime_executor,
                         completed_nodes=set(selected_nodes[: path_index + 1]),
                         decision_node=logical,
@@ -411,9 +458,8 @@ class MintController:
 
             business_end_sec = monotonic_sec()
             workflow_end_time = utc_now_iso()
-            if runtime_pending:
-                task = runtime_pending
-                runtime_pending = None
+            for task in list(runtime_pending_tasks):
+                runtime_pending_tasks.remove(task)
                 self._complete_runtime_warmup(run_id, task)
         except BaseException as exc:
             primary_error = exc
@@ -421,9 +467,8 @@ class MintController:
         finally:
             if primary_error is not None and self._runtime_replanning_enabled():
                 self._cancel_unsubmitted_pending(run_id, index, "workflow_failed_before_submission")
-            if runtime_pending:
-                task = runtime_pending
-                runtime_pending = None
+            for task in list(runtime_pending_tasks):
+                runtime_pending_tasks.remove(task)
                 try:
                     self._complete_runtime_warmup(run_id, task)
                 except Exception:
@@ -450,6 +495,11 @@ class MintController:
         if business_end_sec is None:
             raise RuntimeError("workflow ended without a business completion timestamp")
         latency_ms = round((business_end_sec - planned_arrival_sec) * 1000.0, 3)
+        provisioned_duration_sec = round(
+            self._provisioned_slots
+            * max(0.0, business_end_sec - workflow_start),
+            6,
+        )
         summary_event = WorkflowRunSummary(
             event_type="workflow_summary",
             run_id=run_id,
@@ -460,6 +510,8 @@ class MintController:
             latency_ms=latency_ms,
             cold_start_count=cold_count,
             warmup_count=warmup_count,
+            provisioned_slots=self._provisioned_slots,
+            provisioned_duration_sec=provisioned_duration_sec,
             reserved_budget=reserved_budget,
             consumed_budget=consumed_budget,
             budget_limit=self._warmup_budget(),
@@ -509,7 +561,15 @@ class MintController:
         )
         if self._runtime_replanning_enabled() or exclude_entry_nodes:
             intents = [intent for intent in intents if intent.logical_name not in self.dag.entry_nodes]
-        if self.baseline in {"path_aware_greedy", "xanadu_like"}:
+        if self.baseline == "provisioned_concurrency":
+            actions = []
+        elif self.baseline == "orion_full":
+            actions = self._orion_full_actions(intents)
+        elif self.baseline == "faascache":
+            actions = self._faascache_full_actions(intents)
+        elif self.baseline == "xanadu_full":
+            actions = self._xanadu_full_actions(intents)
+        elif self.baseline in {"path_aware_greedy", "xanadu_like"}:
             actions = self._path_aware_greedy_actions(intents)
         elif self.baseline == "oracle_path":
             actions = self._oracle_path_actions(intents, selected_nodes)
@@ -661,6 +721,7 @@ class MintController:
                 if not self._runtime_replanning_enabled():
                     count += 1
                 self._warmup_failures_by_run[run_id] = self._warmup_failures_by_run.get(run_id, 0) + 1
+                self._orion_pending_bundles.pop(intent.intent_id, None)
                 continue
             target_hit = intent.logical_name in selected_nodes
             ready_before_arrival = bool(
@@ -716,6 +777,10 @@ class MintController:
             if not self._runtime_replanning_enabled():
                 count += 1
             self._executed_warmups_by_run.setdefault(run_id, []).append(intent.logical_name)
+            if self.baseline == "orion_full":
+                self._apply_orion_bundle_success(run_id, intent, observed, invoke_end_sec)
+            if self.baseline == "faascache" and self._faascache is not None:
+                self._faascache.insert(intent.logical_name)
         return count
 
     def _create_and_reserve_lifecycle_intent(
@@ -824,6 +889,14 @@ class MintController:
         intents: list[WarmupIntent],
         workflow_index: int,
     ) -> None:
+        """Reserve up to (B - initial) predicted descendants as pending intents.
+
+        The runtime intent-maintenance design keeps one immediate warmup slot
+        plus one or more pending slots, so a budget B reserves at most B-1
+        predicted descendants before the branch is revealed.  Each pending
+        intent holds one reserved budget unit and is reconciled against the
+        realized path after branch revelation.
+        """
         ledger = self._intent_ledgers_by_run[run_id]
         if ledger.snapshot().available_budget <= 0:
             return
@@ -832,47 +905,50 @@ class MintController:
             return
         decision_node, predicted_branch = prediction
         executed = set(self._executed_warmups_by_run.get(run_id, []))
-        known_intent_targets = {
-            record.target for record in ledger.records()
-        }
-        candidate = self._best_runtime_candidate(
-            intents,
-            predicted_branch,
-            completed_nodes={decision_node},
-            excluded_nodes=executed | known_intent_targets,
-            budget=ledger.snapshot().available_budget,
-        )
-        if candidate is None:
-            return
-        intent, gain = candidate
-        probabilities = json.dumps(self._active_model_snapshot.get("probabilities", {}), sort_keys=True)
-        append_jsonl(
-            self.events_path,
-            SchedulerDecision(
-                event_type="scheduler_decision",
-                run_id=run_id,
-                workflow_index=workflow_index,
-                intent_id=intent.intent_id,
-                function_name=intent.function_name,
-                logical_name=intent.logical_name,
-                action="plan_pending",
-                action_reason="predicted_descendant_reserved_until_branch_reveal",
-                gain=gain,
-                planned_time_sec=intent.planned_time_sec,
-                decision_phase="initial",
-                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                branch_probabilities=probabilities,
-                decision_node=decision_node,
-            ).to_dict(),
-        )
-        self._create_and_reserve_lifecycle_intent(
-            run_id,
-            intent,
-            workflow_index,
-            decision_phase="initial_pending",
-            reason="predicted_descendant_pending_until_branch_reveal",
-        )
-        self._pending_intents_by_run[run_id] = intent
+        pending: list[WarmupIntent] = []
+        for _ in range(max(0, ledger.snapshot().available_budget)):
+            known_targets = {record.target for record in ledger.records()}
+            candidate = self._best_runtime_candidate(
+                intents,
+                predicted_branch,
+                completed_nodes={decision_node},
+                excluded_nodes=executed | known_targets,
+                budget=ledger.snapshot().available_budget,
+            )
+            if candidate is None:
+                break
+            intent, gain = candidate
+            probabilities = json.dumps(
+                self._active_model_snapshot.get("probabilities", {}), sort_keys=True
+            )
+            append_jsonl(
+                self.events_path,
+                SchedulerDecision(
+                    event_type="scheduler_decision",
+                    run_id=run_id,
+                    workflow_index=workflow_index,
+                    intent_id=intent.intent_id,
+                    function_name=intent.function_name,
+                    logical_name=intent.logical_name,
+                    action="plan_pending",
+                    action_reason="predicted_descendant_reserved_until_branch_reveal",
+                    gain=gain,
+                    planned_time_sec=intent.planned_time_sec,
+                    decision_phase="initial",
+                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                    branch_probabilities=probabilities,
+                    decision_node=decision_node,
+                ).to_dict(),
+            )
+            self._create_and_reserve_lifecycle_intent(
+                run_id,
+                intent,
+                workflow_index,
+                decision_phase="initial_pending",
+                reason="predicted_descendant_pending_until_branch_reveal",
+            )
+            pending.append(intent)
+        self._pending_intents_by_run[run_id] = pending
 
     def _predicted_branch_successor(self) -> tuple[str, str] | None:
         if not self.dag.branch_rules:
@@ -961,7 +1037,7 @@ class MintController:
         executor: ThreadPoolExecutor,
         completed_nodes: set[str],
         decision_node: str,
-    ) -> RuntimeWarmupTask | None:
+    ) -> list[RuntimeWarmupTask]:
         if observed_branch not in self.dag.nodes:
             raise ValueError(f"observed branch is not a DAG node: {observed_branch}")
         actual_targets = self.dag.reachable_from([observed_branch])
@@ -1010,125 +1086,197 @@ class MintController:
             )
 
         ledger = self._intent_ledgers_by_run[run_id]
-        pending_intent = self._pending_intents_by_run.get(run_id)
-        if pending_intent is None:
-            return None
-        record = ledger.get_record(pending_intent.intent_id)
-        if record is None:
-            raise RuntimeError(f"pending intent missing from lifecycle ledger: {pending_intent.intent_id}")
-        scheduled_task = self._scheduled_tasks_by_run.get(run_id)
-        if scheduled_task is None:
-            return None
+        pending_tasks = list(self._scheduled_tasks_by_run.get(run_id, []))
+        if not pending_tasks:
+            return []
+        pending_targets = {task.intent.logical_name for task in pending_tasks}
+        retained: list[RuntimeWarmupTask] = []
 
-        pending_is_valid = pending_intent.logical_name in actual_targets
-        if pending_is_valid:
-            reason = (
-                "runtime_branch_confirmed_pending_intent"
-                if record.state is IntentState.PENDING
-                else "runtime_branch_confirmed_intent_already_in_flight"
-            )
-            append_jsonl(
-                self.events_path,
-                SchedulerDecision(
-                    event_type="scheduler_decision",
-                    run_id=run_id,
-                    workflow_index=workflow_index,
-                    intent_id=pending_intent.intent_id,
-                    function_name=pending_intent.function_name,
-                    logical_name=pending_intent.logical_name,
-                    action="execute_pending",
-                    action_reason=reason,
-                    gain=pending_intent.offline_gain,
-                    planned_time_sec=pending_intent.planned_time_sec,
-                    decision_phase="runtime_after_branch",
-                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                    branch_probabilities=probabilities,
-                    decision_node=decision_node,
-                ).to_dict(),
-            )
-            return self._activate_scheduled_task(
-                scheduled_task,
-                action="execute_pending",
-                useful=True,
-                action_reason=reason,
-                gain=pending_intent.offline_gain,
-                activate=True,
-            )
-
-        if self.baseline == "mint_markov_no_cancel":
-            append_jsonl(
-                self.events_path,
-                SchedulerDecision(
-                    event_type="scheduler_decision",
-                    run_id=run_id,
-                    workflow_index=workflow_index,
-                    intent_id=pending_intent.intent_id,
-                    function_name=pending_intent.function_name,
-                    logical_name=pending_intent.logical_name,
-                    action="execute_pending",
-                    action_reason="ablation_no_cancel_executes_stale_pending_intent",
-                    gain=pending_intent.offline_gain,
-                    planned_time_sec=pending_intent.planned_time_sec,
-                    decision_phase="runtime_after_branch",
-                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                    branch_probabilities=probabilities,
-                    decision_node=decision_node,
-                ).to_dict(),
-            )
-            return self._activate_scheduled_task(
-                scheduled_task,
-                action="execute_pending",
-                useful=False,
-                action_reason="ablation_no_cancel_executes_stale_pending_intent",
-                gain=pending_intent.offline_gain,
-                activate=False,
-            )
-
-        if record.state is not IntentState.PENDING:
-            rejected = ledger.cancel_pending(
-                pending_intent.intent_id, reason="runtime_cancel_race_lost_to_submission"
-            )
-            return self._handle_cancel_race_lost(
-                run_id,
-                pending_intent,
-                scheduled_task,
-                rejected,
-                workflow_index,
-                probabilities,
-                decision_node,
-            )
-
-        replacement = self._best_runtime_candidate(
-            intents,
-            observed_branch,
-            completed_nodes=completed_nodes,
-            excluded_nodes=set(executed) | {pending_intent.logical_name},
-            budget=1,
-        )
-        if self.baseline == "mint_markov_cancel_only" or replacement is None:
-            cancelled = ledger.cancel_pending(
-                pending_intent.intent_id,
-                reason=(
-                    "ablation_cancel_only_releases_reservation"
-                    if self.baseline == "mint_markov_cancel_only"
-                    else "runtime_invalid_pending_without_profitable_replacement"
-                ),
-            )
-            if not cancelled.accepted:
-                return self._handle_cancel_race_lost(
-                    run_id,
-                    pending_intent,
-                    scheduled_task,
-                    cancelled,
-                    workflow_index,
-                    probabilities,
-                    decision_node,
+        for scheduled_task in pending_tasks:
+            pending_intent = scheduled_task.intent
+            record = ledger.get_record(pending_intent.intent_id)
+            if record is None:
+                raise RuntimeError(
+                    f"pending intent missing from lifecycle ledger: {pending_intent.intent_id}"
                 )
-            self._append_lifecycle_result(run_id, cancelled, workflow_index, "runtime_after_branch")
-            self._require_lifecycle_transition(cancelled)
-            self._pending_intents_by_run.pop(run_id, None)
-            self._scheduled_tasks_by_run.pop(run_id, None)
+
+            pending_is_valid = pending_intent.logical_name in actual_targets
+            if pending_is_valid:
+                reason = (
+                    "runtime_branch_confirmed_pending_intent"
+                    if record.state is IntentState.PENDING
+                    else "runtime_branch_confirmed_intent_already_in_flight"
+                )
+                append_jsonl(
+                    self.events_path,
+                    SchedulerDecision(
+                        event_type="scheduler_decision",
+                        run_id=run_id,
+                        workflow_index=workflow_index,
+                        intent_id=pending_intent.intent_id,
+                        function_name=pending_intent.function_name,
+                        logical_name=pending_intent.logical_name,
+                        action="execute_pending",
+                        action_reason=reason,
+                        gain=pending_intent.offline_gain,
+                        planned_time_sec=pending_intent.planned_time_sec,
+                        decision_phase="runtime_after_branch",
+                        model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                        branch_probabilities=probabilities,
+                        decision_node=decision_node,
+                    ).to_dict(),
+                )
+                retained.append(
+                    self._activate_scheduled_task(
+                        scheduled_task,
+                        action="execute_pending",
+                        useful=True,
+                        action_reason=reason,
+                        gain=pending_intent.offline_gain,
+                        activate=True,
+                    )
+                )
+                continue
+
+            if self.baseline == "mint_markov_no_cancel":
+                append_jsonl(
+                    self.events_path,
+                    SchedulerDecision(
+                        event_type="scheduler_decision",
+                        run_id=run_id,
+                        workflow_index=workflow_index,
+                        intent_id=pending_intent.intent_id,
+                        function_name=pending_intent.function_name,
+                        logical_name=pending_intent.logical_name,
+                        action="execute_pending",
+                        action_reason="ablation_no_cancel_executes_stale_pending_intent",
+                        gain=pending_intent.offline_gain,
+                        planned_time_sec=pending_intent.planned_time_sec,
+                        decision_phase="runtime_after_branch",
+                        model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                        branch_probabilities=probabilities,
+                        decision_node=decision_node,
+                    ).to_dict(),
+                )
+                retained.append(
+                    self._activate_scheduled_task(
+                        scheduled_task,
+                        action="execute_pending",
+                        useful=False,
+                        action_reason="ablation_no_cancel_executes_stale_pending_intent",
+                        gain=pending_intent.offline_gain,
+                        activate=False,
+                    )
+                )
+                continue
+
+            if record.state is not IntentState.PENDING:
+                rejected = ledger.cancel_pending(
+                    pending_intent.intent_id,
+                    reason="runtime_cancel_race_lost_to_submission",
+                )
+                retained.append(
+                    self._handle_cancel_race_lost(
+                        run_id,
+                        pending_intent,
+                        scheduled_task,
+                        rejected,
+                        workflow_index,
+                        probabilities,
+                        decision_node,
+                    )
+                )
+                continue
+
+            replacement = self._best_runtime_candidate(
+                intents,
+                observed_branch,
+                completed_nodes=completed_nodes,
+                excluded_nodes=set(executed) | pending_targets,
+                budget=1,
+            )
+            if self.baseline == "mint_markov_cancel_only" or replacement is None:
+                cancelled = ledger.cancel_pending(
+                    pending_intent.intent_id,
+                    reason=(
+                        "ablation_cancel_only_releases_reservation"
+                        if self.baseline == "mint_markov_cancel_only"
+                        else "runtime_invalid_pending_without_profitable_replacement"
+                    ),
+                )
+                if not cancelled.accepted:
+                    retained.append(
+                        self._handle_cancel_race_lost(
+                            run_id,
+                            pending_intent,
+                            scheduled_task,
+                            cancelled,
+                            workflow_index,
+                            probabilities,
+                            decision_node,
+                        )
+                    )
+                    continue
+                self._append_lifecycle_result(
+                    run_id, cancelled, workflow_index, "runtime_after_branch"
+                )
+                self._require_lifecycle_transition(cancelled)
+                scheduled_task.activation_event.set()
+                self._remove_scheduled_task(
+                    run_id, pending_intent.intent_id
+                )
+                append_jsonl(
+                    self.events_path,
+                    SchedulerDecision(
+                        event_type="scheduler_decision",
+                        run_id=run_id,
+                        workflow_index=workflow_index,
+                        intent_id=pending_intent.intent_id,
+                        function_name=pending_intent.function_name,
+                        logical_name=pending_intent.logical_name,
+                        action="cancel_pending",
+                        action_reason=cancelled.transitions[0].reason,
+                        gain=0.0,
+                        planned_time_sec=pending_intent.planned_time_sec,
+                        decision_phase="runtime_after_branch",
+                        model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                        branch_probabilities=probabilities,
+                        decision_node=decision_node,
+                    ).to_dict(),
+                )
+                continue
+
+            replacement_intent, runtime_gain = replacement
+            replaced = ledger.atomic_replace(
+                pending_intent.intent_id,
+                replacement_intent.intent_id,
+                replacement_intent.logical_name,
+                metadata={
+                    "function_name": replacement_intent.function_name,
+                    "decision_phase": "runtime_after_branch",
+                },
+                scheduled_start_time=replacement_intent.planned_time_sec,
+                reason="runtime_invalid_pending_replaced_atomically",
+            )
+            if not replaced.accepted:
+                retained.append(
+                    self._handle_cancel_race_lost(
+                        run_id,
+                        pending_intent,
+                        scheduled_task,
+                        replaced,
+                        workflow_index,
+                        probabilities,
+                        decision_node,
+                    )
+                )
+                continue
+            self._append_lifecycle_result(
+                run_id, replaced, workflow_index, "runtime_after_branch"
+            )
+            self._require_lifecycle_transition(replaced)
             scheduled_task.activation_event.set()
+            self._remove_scheduled_task(run_id, pending_intent.intent_id)
             append_jsonl(
                 self.events_path,
                 SchedulerDecision(
@@ -1139,7 +1287,7 @@ class MintController:
                     function_name=pending_intent.function_name,
                     logical_name=pending_intent.logical_name,
                     action="cancel_pending",
-                    action_reason=cancelled.transitions[0].reason,
+                    action_reason="runtime_invalid_pending_cancelled_before_submission",
                     gain=0.0,
                     planned_time_sec=pending_intent.planned_time_sec,
                     decision_phase="runtime_after_branch",
@@ -1148,86 +1296,45 @@ class MintController:
                     decision_node=decision_node,
                 ).to_dict(),
             )
-            return None
-
-        replacement_intent, runtime_gain = replacement
-        replaced = ledger.atomic_replace(
-            pending_intent.intent_id,
-            replacement_intent.intent_id,
-            replacement_intent.logical_name,
-            metadata={
-                "function_name": replacement_intent.function_name,
-                "decision_phase": "runtime_after_branch",
-            },
-            scheduled_start_time=replacement_intent.planned_time_sec,
-            reason="runtime_invalid_pending_replaced_atomically",
-        )
-        if not replaced.accepted:
-            return self._handle_cancel_race_lost(
-                run_id,
-                pending_intent,
-                scheduled_task,
-                replaced,
-                workflow_index,
-                probabilities,
-                decision_node,
+            append_jsonl(
+                self.events_path,
+                SchedulerDecision(
+                    event_type="scheduler_decision",
+                    run_id=run_id,
+                    workflow_index=workflow_index,
+                    intent_id=replacement_intent.intent_id,
+                    function_name=replacement_intent.function_name,
+                    logical_name=replacement_intent.logical_name,
+                    action="replacement_warmup",
+                    action_reason="runtime_branch_observation_parallel_successor_warmup",
+                    gain=runtime_gain,
+                    planned_time_sec=replacement_intent.planned_time_sec,
+                    decision_phase="runtime_after_branch",
+                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                    branch_probabilities=probabilities,
+                    supersedes_intent_id=pending_intent.intent_id,
+                    decision_node=decision_node,
+                ).to_dict(),
             )
-        self._append_lifecycle_result(run_id, replaced, workflow_index, "runtime_after_branch")
-        self._require_lifecycle_transition(replaced)
-        scheduled_task.activation_event.set()
-        self._scheduled_tasks_by_run.pop(run_id, None)
-        append_jsonl(
-            self.events_path,
-            SchedulerDecision(
-                event_type="scheduler_decision",
-                run_id=run_id,
-                workflow_index=workflow_index,
-                intent_id=pending_intent.intent_id,
-                function_name=pending_intent.function_name,
-                logical_name=pending_intent.logical_name,
-                action="cancel_pending",
-                action_reason="runtime_invalid_pending_cancelled_before_submission",
-                gain=0.0,
-                planned_time_sec=pending_intent.planned_time_sec,
-                decision_phase="runtime_after_branch",
-                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                branch_probabilities=probabilities,
-                decision_node=decision_node,
-            ).to_dict(),
-        )
-        append_jsonl(
-            self.events_path,
-            SchedulerDecision(
-                event_type="scheduler_decision",
-                run_id=run_id,
-                workflow_index=workflow_index,
-                intent_id=replacement_intent.intent_id,
-                function_name=replacement_intent.function_name,
-                logical_name=replacement_intent.logical_name,
+            new_task = self._schedule_pending_intent(
+                run_id,
+                replacement_intent,
+                workflow_index,
+                executor,
+                scheduled_submit_sec=monotonic_sec(),
                 action="replacement_warmup",
+                useful=True,
                 action_reason="runtime_branch_observation_parallel_successor_warmup",
                 gain=runtime_gain,
-                planned_time_sec=replacement_intent.planned_time_sec,
-                decision_phase="runtime_after_branch",
-                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                branch_probabilities=probabilities,
-                supersedes_intent_id=pending_intent.intent_id,
-                decision_node=decision_node,
-            ).to_dict(),
-        )
-        self._pending_intents_by_run[run_id] = replacement_intent
-        return self._schedule_pending_intent(
-            run_id,
-            replacement_intent,
-            workflow_index,
-            executor,
-            scheduled_submit_sec=monotonic_sec(),
-            action="replacement_warmup",
-            useful=True,
-            action_reason="runtime_branch_observation_parallel_successor_warmup",
-            gain=runtime_gain,
-            activate_immediately=True,
-        )
+                activate_immediately=True,
+            )
+            if new_task is not None:
+                retained.append(new_task)
+
+        self._pending_intents_by_run[run_id] = [
+            task.intent for task in retained
+        ]
+        return retained
 
     def _handle_cancel_race_lost(
         self,
@@ -1300,7 +1407,7 @@ class MintController:
             )
             self._append_lifecycle_result(run_id, cancelled, workflow_index, "scheduler")
             self._require_lifecycle_transition(cancelled)
-            self._pending_intents_by_run.pop(run_id, None)
+            self._remove_pending_intent(run_id, intent.intent_id)
             self._scheduler_failures_by_run[run_id] = (
                 self._scheduler_failures_by_run.get(run_id, 0) + 1
             )
@@ -1334,7 +1441,7 @@ class MintController:
             activation_event=activation_event,
             scheduled_submit_sec=scheduled_submit_sec,
         )
-        self._scheduled_tasks_by_run[run_id] = task
+        self._scheduled_tasks_by_run.setdefault(run_id, []).append(task)
         if activate_immediately:
             activation_event.set()
         return task
@@ -1356,6 +1463,44 @@ class MintController:
         if activate:
             task.activation_event.set()
         return task
+
+    @staticmethod
+    def _find_task_for_node(
+        tasks: list[RuntimeWarmupTask],
+        logical_name: str,
+    ) -> RuntimeWarmupTask | None:
+        for task in tasks:
+            if task.intent.logical_name == logical_name:
+                return task
+        return None
+
+    def _find_task_by_intent_id(
+        self,
+        run_id: str,
+        intent_id: str,
+    ) -> RuntimeWarmupTask | None:
+        for task in self._scheduled_tasks_by_run.get(run_id, []):
+            if task.lifecycle_intent_id == intent_id:
+                return task
+        return None
+
+    def _remove_pending_intent(self, run_id: str, intent_id: str) -> None:
+        pending = self._pending_intents_by_run.get(run_id)
+        if pending is None:
+            return
+        for index, intent in enumerate(pending):
+            if intent.intent_id == intent_id:
+                pending.pop(index)
+                break
+
+    def _remove_scheduled_task(self, run_id: str, intent_id: str) -> None:
+        tasks = self._scheduled_tasks_by_run.get(run_id)
+        if tasks is None:
+            return
+        for index, task in enumerate(tasks):
+            if task.lifecycle_intent_id == intent_id:
+                tasks.pop(index)
+                break
 
     def _run_scheduled_pending_intent(
         self,
@@ -1423,43 +1568,47 @@ class MintController:
         workflow_index: int,
         reason: str,
     ) -> None:
-        intent = self._pending_intents_by_run.get(run_id)
-        if intent is None:
+        pending_intents = list(self._pending_intents_by_run.get(run_id, []))
+        if not pending_intents:
             return
         ledger = self._intent_ledgers_by_run[run_id]
-        record = ledger.get_record(intent.intent_id)
-        if record is None or record.state is not IntentState.PENDING:
-            return
-        cancelled = ledger.cancel_pending(intent.intent_id, reason=reason)
-        if not cancelled.accepted:
-            self._append_lifecycle_rejection(
-                run_id, intent, cancelled, workflow_index, "cleanup"
+        for intent in pending_intents:
+            record = ledger.get_record(intent.intent_id)
+            if record is None or record.state is not IntentState.PENDING:
+                continue
+            cancelled = ledger.cancel_pending(intent.intent_id, reason=reason)
+            if not cancelled.accepted:
+                self._append_lifecycle_rejection(
+                    run_id, intent, cancelled, workflow_index, "cleanup"
+                )
+                continue
+            self._append_lifecycle_result(
+                run_id, cancelled, workflow_index, "cleanup"
             )
-            return
-        self._append_lifecycle_result(run_id, cancelled, workflow_index, "cleanup")
-        self._require_lifecycle_transition(cancelled)
-        self._pending_intents_by_run.pop(run_id, None)
-        task = self._scheduled_tasks_by_run.pop(run_id, None)
-        if task is not None and task.lifecycle_intent_id == intent.intent_id:
-            task.activation_event.set()
-        append_jsonl(
-            self.events_path,
-            SchedulerDecision(
-                event_type="scheduler_decision",
-                run_id=run_id,
-                workflow_index=workflow_index,
-                intent_id=intent.intent_id,
-                function_name=intent.function_name,
-                logical_name=intent.logical_name,
-                action="cancel_pending",
-                action_reason=reason,
-                gain=0.0,
-                planned_time_sec=intent.planned_time_sec,
-                decision_phase="cleanup",
-                model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
-                branch_probabilities=json.dumps(
-                    self._active_model_snapshot.get("probabilities", {}), sort_keys=True
-                ),
+            self._require_lifecycle_transition(cancelled)
+            self._remove_pending_intent(run_id, intent.intent_id)
+            task = self._find_task_by_intent_id(run_id, intent.intent_id)
+            if task is not None:
+                task.activation_event.set()
+            self._remove_scheduled_task(run_id, intent.intent_id)
+            append_jsonl(
+                self.events_path,
+                SchedulerDecision(
+                    event_type="scheduler_decision",
+                    run_id=run_id,
+                    workflow_index=workflow_index,
+                    intent_id=intent.intent_id,
+                    function_name=intent.function_name,
+                    logical_name=intent.logical_name,
+                    action="cancel_pending",
+                    action_reason=reason,
+                    gain=0.0,
+                    planned_time_sec=intent.planned_time_sec,
+                    decision_phase="cleanup",
+                    model_history_size=int(self._active_model_snapshot.get("history_size", 0)),
+                    branch_probabilities=json.dumps(
+                        self._active_model_snapshot.get("probabilities", {}), sort_keys=True
+                    ),
                 ).to_dict(),
             )
 
@@ -1642,12 +1791,18 @@ class MintController:
         return True
 
     def _clear_current_scheduled_task(self, run_id: str, task: RuntimeWarmupTask) -> None:
-        current = self._scheduled_tasks_by_run.get(run_id)
-        if current is not None and current.lifecycle_intent_id == task.lifecycle_intent_id:
-            self._scheduled_tasks_by_run.pop(run_id, None)
-        current_intent = self._pending_intents_by_run.get(run_id)
-        if current_intent is not None and current_intent.intent_id == task.lifecycle_intent_id:
-            self._pending_intents_by_run.pop(run_id, None)
+        tasks = self._scheduled_tasks_by_run.get(run_id)
+        if tasks is not None:
+            for index, current in enumerate(tasks):
+                if current.lifecycle_intent_id == task.lifecycle_intent_id:
+                    tasks.pop(index)
+                    break
+        pending = self._pending_intents_by_run.get(run_id)
+        if pending is not None:
+            for index, current_intent in enumerate(pending):
+                if current_intent.intent_id == task.lifecycle_intent_id:
+                    pending.pop(index)
+                    break
 
     def _initial_warmup_budget(self) -> int:
         total = self._warmup_budget()
@@ -1689,12 +1844,20 @@ class MintController:
             return "periodic"
         if self.baseline == "orion_like":
             return "orion_like"
+        if self.baseline == "orion_full":
+            return "orion_full"
+        if self.baseline == "faascache":
+            return "faascache"
         if self.baseline == "path_aware_greedy":
             return "runtime_greedy"
+        if self.baseline == "xanadu_full":
+            return "xanadu_full"
         if self.baseline == "xanadu_like":
             return "xanadu_like"
         if self.baseline == "oracle_path":
             return "oracle"
+        if self.baseline == "provisioned_concurrency":
+            return "provisioned"
         return self.config.get("planner", {}).get("type", "heuristic")
 
     def _planner_config(self) -> dict[str, Any]:
@@ -1745,6 +1908,15 @@ class MintController:
         return list(self.dag.entry_nodes)
 
     def _profile_call_probability(self) -> dict[str, float]:
+        calibrated = self.config.get("experiment", {}).get("trace_calibration", {})
+        branch_probabilities = calibrated.get("branch_probabilities", {})
+        if branch_probabilities:
+            probabilities = {node: 1.0 for node in self.dag.nodes}
+            for _decision_node, mapping in branch_probabilities.items():
+                for target, probability in mapping.items():
+                    if target in probabilities:
+                        probabilities[target] = float(probability)
+            return probabilities
         probabilities = {node: 1.0 for node in self.dag.nodes}
         if self.dag.name == "branch":
             for node in {"f2", "f3", "f4", "f5"} & set(self.dag.nodes):
@@ -1884,6 +2056,258 @@ class MintController:
             else:
                 actions.append(WarmupAction("cancel_pending", intent, intent.offline_gain, "oracle_budget_exceeded"))
         return actions
+
+    def _orion_profile(self) -> OrionProfile:
+        baseline_cfg = self.config.get("baseline", {}).get("orion_full", {})
+        base_cold = float(
+            self.config.get("platform", {}).get("default_cold_start_ms", 800)
+        )
+        return OrionProfile(
+            memory_options=tuple(
+                int(memory)
+                for memory in baseline_cfg.get("memory_options", (128, 256, 512, 1024))
+            ),
+            decay=float(baseline_cfg.get("decay", 0.5)),
+            base_cold_ms=base_cold,
+        )
+
+    def _orion_call_probability(self) -> dict[str, float]:
+        ema = self._orion_ema
+        max_value = max(ema.values()) if ema else 0.0
+        if max_value <= 0.0:
+            return self._profile_call_probability()
+        return {
+            node: round(ema[node] / max_value, 6) for node in self.dag.nodes
+        }
+
+    def _orion_full_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        profile = self._orion_profile()
+        call_probability = self._orion_call_probability()
+        downstream = self.dag.downstream_counts()
+        max_downstream = max(downstream.values() or [1])
+        downstream_weight = {
+            node: 1.0 + downstream.get(node, 0) / max(max_downstream, 1)
+            for node in self.dag.nodes
+        }
+        now = monotonic_sec()
+        hot_nodes = {
+            node for node, until in self._hot_until.items() if until > now
+        }
+        decisions = orion_decide(
+            profile,
+            self._orion_bundles,
+            call_probability,
+            downstream_weight,
+            hot_nodes,
+            self._orion_warm_bundle_ids,
+            self._warmup_budget(),
+        )
+        intent_by_node = {intent.logical_name: intent for intent in intents}
+        actions: list[WarmupAction] = []
+        for decision in decisions:
+            intent = intent_by_node.get(decision.bundle.representative)
+            if intent is None:
+                continue
+            actions.append(
+                WarmupAction(
+                    "execute",
+                    intent,
+                    decision.gain,
+                    f"orion_full_bundle:{decision.bundle.bundle_id}:mem{decision.memory_mb}",
+                )
+            )
+            self._orion_pending_bundles[intent.intent_id] = (
+                decision.bundle,
+                decision.memory_mb,
+            )
+        return actions
+
+    def _apply_orion_bundle_success(
+        self,
+        run_id: str,
+        intent: WarmupIntent,
+        observed: dict[str, Any],
+        invoke_end_sec: float,
+    ) -> None:
+        pending = self._orion_pending_bundles.pop(intent.intent_id, None)
+        if pending is None:
+            return
+        bundle, memory_mb = pending
+        retention = float(
+            self.config.get("platform", {}).get("default_retention_sec", 300)
+        )
+        for member in bundle.members:
+            self._hot_until[member] = invoke_end_sec + retention
+            self._last_environment_ids[member] = observed["execution_environment_id"]
+        self._orion_warm_bundle_ids.add(bundle.bundle_id)
+        self._orion_memory_by_bundle[bundle.bundle_id] = memory_mb
+
+    def _observe_orion_invocation(self, logical_name: str) -> None:
+        if self.baseline != "orion_full":
+            return
+        decay = self._orion_profile().decay
+        for node in self._orion_ema:
+            self._orion_ema[node] *= decay
+        self._orion_ema[logical_name] += 1.0 - decay
+
+    def _faascache_profile(self) -> FaasCacheProfile:
+        baseline_cfg = self.config.get("baseline", {}).get("faascache", {})
+        cold_ms = self.config.get("platform", {}).get("cold_start_ms", {})
+        return FaasCacheProfile(
+            frequency_decay=float(baseline_cfg.get("frequency_decay", 0.0)),
+            size_mb=baseline_cfg.get("size_mb"),
+            cold_start_ms=dict(cold_ms) if cold_ms else None,
+            base_cold_ms=float(
+                self.config.get("platform", {}).get("default_cold_start_ms", 800)
+            ),
+        )
+
+    def _faascache_full_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        """GDSF selection: fill/replace the B keep-warm slots by value."""
+        cache = self._faascache
+        if cache is None:
+            return []
+        now = monotonic_sec()
+        budget = self._warmup_budget()
+        actions: list[WarmupAction] = []
+        candidates: list[WarmupIntent] = []
+        for intent in intents:
+            node = intent.logical_name
+            if self._hot_until.get(node, 0.0) > now:
+                actions.append(
+                    WarmupAction(
+                        "cancel_pending",
+                        intent,
+                        cache.value(node),
+                        "faascache_already_hot",
+                    )
+                )
+            else:
+                candidates.append(intent)
+        ranked = sorted(
+            candidates,
+            key=lambda intent: (-cache.value(intent.logical_name), intent.logical_name),
+        )
+        targets = set(
+            cache.allocate((intent.logical_name for intent in ranked), budget)
+        )
+        for intent in ranked:
+            if intent.logical_name in targets:
+                actions.append(
+                    WarmupAction(
+                        "execute",
+                        intent,
+                        cache.value(intent.logical_name),
+                        "faascache_gdsf_top_value",
+                    )
+                )
+            else:
+                actions.append(
+                    WarmupAction(
+                        "cancel_pending",
+                        intent,
+                        cache.value(intent.logical_name),
+                        "faascache_not_in_top_value",
+                    )
+                )
+        return actions
+
+    def _observe_faascache_invocation(self, logical_name: str) -> None:
+        if self.baseline != "faascache" or self._faascache is None:
+            return
+        self._faascache.observe(logical_name)
+
+    def _xanadu_call_probability(self) -> dict[str, float]:
+        """MLP probabilities: trace/static profile overlaid with the learned
+        branch model where the workload exposes explicit branch names."""
+        probabilities = self._profile_call_probability()
+        learned = self._active_model_snapshot.get("probabilities", {})
+        if not learned:
+            return probabilities
+        if self.dag.name in {"branch", "mixed", "deep_mixed"}:
+            mapping = {"left": "f2", "right": "f3"}
+            for branch_key, node in mapping.items():
+                if branch_key in learned and node in probabilities:
+                    probabilities[node] = float(learned[branch_key])
+        else:
+            for node in self.dag.nodes:
+                if node in learned:
+                    probabilities[node] = float(learned[node])
+        return probabilities
+
+    def _xanadu_full_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
+        """Xanadu MLP selection: warm the earliest-stage most-likely-path
+        members that are not already warm, within budget B."""
+        call_probability = self._xanadu_call_probability()
+        path = most_likely_path(self.dag, call_probability)
+        path_set = set(path)
+        now = monotonic_sec()
+        budget = self._warmup_budget()
+        stages = self.dag.stages()
+        ordered = sorted(
+            (
+                intent
+                for intent in intents
+                if intent.logical_name in path_set
+                and intent.logical_name not in self.dag.entry_nodes
+            ),
+            key=lambda intent: (
+                stages.get(intent.logical_name, 0),
+                intent.logical_name,
+            ),
+        )
+        targets: list[str] = []
+        for intent in ordered:
+            if len(targets) >= budget:
+                break
+            if self._hot_until.get(intent.logical_name, 0.0) <= now:
+                targets.append(intent.logical_name)
+        target_set = set(targets)
+        actions: list[WarmupAction] = []
+        for intent in intents:
+            node = intent.logical_name
+            if node in self.dag.entry_nodes:
+                reason = "xanadu_full_entry_not_prewarmed"
+                action_type = "cancel_pending"
+            elif node not in path_set:
+                reason = "xanadu_full_not_on_mle_path"
+                action_type = "cancel_pending"
+            elif node in target_set:
+                reason = "xanadu_full_mle_jit"
+                action_type = "execute"
+            elif self._hot_until.get(node, 0.0) > now:
+                reason = "xanadu_full_already_hot"
+                action_type = "cancel_pending"
+            else:
+                reason = "xanadu_full_budget_exceeded"
+                action_type = "cancel_pending"
+            actions.append(
+                WarmupAction(
+                    action_type,
+                    intent,
+                    intent.offline_gain,
+                    reason,
+                )
+            )
+        return actions
+
+    def _provisioning_plan(self) -> list[str]:
+        if self.baseline != "provisioned_concurrency":
+            return []
+        budget = self._warmup_budget()
+        call_probability = self._profile_call_probability()
+        downstream = self.dag.downstream_counts()
+        scored = sorted(
+            self.dag.nodes,
+            key=lambda node: (
+                -(
+                    float(call_probability.get(node, 1.0))
+                    * (1.0 + downstream.get(node, 0))
+                ),
+                node,
+            ),
+        )
+        return scored[: max(0, budget)]
 
     def _markov_offline_actions(self, intents: list[WarmupIntent]) -> list[WarmupAction]:
         ranked = sorted(intents, key=lambda item: (-item.offline_gain, item.planned_time_sec, item.logical_name))
@@ -2032,11 +2456,18 @@ class MintController:
             if mismatch:
                 branch_index = (branch_index * 2 + 1) % 3
             return {"branch_index": branch_index}
+        if self.dag.name == "deep_mixed":
+            mismatch = bool(self.config.get("experiment", {}).get("profile_mismatch", False))
+            if mismatch:
+                # Controlled branch-profile mismatch: the planner profile stays
+                # 50/50, while the realized path skews to 1/3 vs 2/3.
+                return {"branch": "left" if (index + branch_seed) % 3 == 0 else "right"}
+            return {"branch": "left" if (index + branch_seed) % 2 == 0 else "right"}
         return {"branch": "left" if (index + branch_seed) % 2 == 0 else "right"}
 
     def _timing_jitter_ms(self, index: int, stage: int) -> float:
         jitter = float(self.config.get("experiment", {}).get("timing_jitter_ms", 0.0))
-        if jitter <= 0 or self.dag.name not in {"deep_mixed", "greedy_trap"}:
+        if jitter <= 0 or self.dag.name not in {"wide_branch", "deep_mixed", "greedy_trap"}:
             return 0.0
         return round(((index + stage) % 3 - 1) * jitter / 2.0, 3)
 

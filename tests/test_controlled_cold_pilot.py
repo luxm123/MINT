@@ -1,3 +1,8 @@
+import json
+
+import pytest
+
+from scripts import run_controlled_cold_pilot
 from scripts.run_controlled_cold_pilot import reset_function_pool, validate_controlled_cold_run
 
 
@@ -91,3 +96,78 @@ def test_validate_controlled_cold_rejects_reused_or_mismatched_environment():
     valid, reason, _ = validate_controlled_cold_run(mismatch, {})
     assert valid is False
     assert reason == "warmup_real_environment_mismatch:f6"
+
+
+def test_real_dynamic_smoke_requires_explicit_calibrated_pending_delay(
+    tmp_path, monkeypatch
+):
+    output_root = tmp_path / "blocked"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_controlled_cold_pilot.py",
+            "--config",
+            "configs/mint_aws_adaptive_smoke.yaml",
+            "--dag",
+            "adaptive_branch",
+            "--baselines",
+            "no_warmup",
+            "mint_markov_full",
+            "--pools",
+            "no_warmup_pool",
+            "mint_full_pool",
+            "--blocks",
+            "1",
+            "--confirm-real-run",
+            "--output-root",
+            str(output_root),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="adaptive-pending-delay-sec"):
+        run_controlled_cold_pilot.main()
+
+
+def test_controlled_cold_dry_run_writes_provenance_and_accepts_adaptive_f9(
+    tmp_path, monkeypatch
+):
+    output_root = tmp_path / "dry"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_controlled_cold_pilot.py",
+            "--config",
+            "configs/mint_aws_adaptive_smoke.yaml",
+            "--dag",
+            "adaptive_branch",
+            "--baselines",
+            "no_warmup",
+            "mint_markov_full",
+            "--pools",
+            "no_warmup_pool",
+            "mint_full_pool",
+            "--blocks",
+            "1",
+            "--post-reset-delay-sec",
+            "0.01",
+            "--warmup-lead-sec",
+            "0",
+            "--adaptive-pending-delay-sec",
+            "0.05",
+            "--dry-run",
+            "--output-root",
+            str(output_root),
+        ],
+    )
+
+    assert run_controlled_cold_pilot.main() == 0
+    reset_rows = (output_root / "reset_log.csv").read_text(encoding="utf-8")
+    assert "mint-nowarm-f9" in reset_rows
+    assert "mint-full-f9" in reset_rows
+    manifest = json.loads(
+        (output_root / "experiment_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["adaptive_pending_delay_sec"] == 0.05
+    assert manifest["pending_delay_source"] == "explicit_cli_calibration"
+    assert manifest["provenance"]["git"]["commit_sha"]
+    assert (output_root / "resolved_config.json").exists()

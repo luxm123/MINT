@@ -24,16 +24,19 @@ Measured metrics include end-to-end latency, latency percentiles, cold-start rat
 Formal experiments should vary:
 
 - DAG: `chain`, `fanout`, `branch`, `join`.
-- Baseline: `no_warmup`, `periodic_keepwarm`, `static_dag`, `orion_like`, `mint_offline`, `mint_full`.
+- Core baselines: `no_warmup`, `orion_full`, `faascache`, `xanadu_full`, `mint_markov_full`.
+- Appendix/ablation baselines: `periodic_keepwarm`, `static_dag`, `orion_like`, `path_aware_greedy`, `xanadu_like`, `oracle_path`, `provisioned_concurrency`, `mint_offline`, `mint_full`.
 - Markov variants: `mint_markov_offline`, `mint_markov_full`.
 - Warmup budget: usually `1`, `2`, and `3`.
-- Repetitions: start with `10` for AWS pilot data, then increase if variance is high.
+- Repetitions: `10` per (dag, baseline, budget, seed); paper runs use multiple
+  branch seeds (`--seeds 42 43 44 45 46`) and report bootstrap confidence
+  intervals over seeds.
 
 The first main experiment should be described as a representative Serverless DAG workflow benchmark, not as a production workload benchmark or a different-load-intensity study. The four DAGs represent workflow structures: `chain` is a linear dependency workflow, `fanout` is a parallel dispatch workflow, `branch` is a runtime path-selection workflow, and `join` is a convergence workflow. Each DAG node is a controlled AWS Lambda microbenchmark function whose body performs controlled lightweight computation or fixed-duration sleep to simulate the function execution phase. The goal is to evaluate DAG-level warmup scheduling behavior across topology patterns, not to model a particular business application or claim coverage of real production traces.
 
-Because fixed prewarming baselines can choose very similar warmup targets on the small standard DAGs, the paper core experiment should use the adaptive stress benchmark. It contains `wide_branch` (`f1 -> branch(f2/f3/f4/f5) -> f6 -> f7`) and `deep_mixed` (`f1 -> f2 or f3`, `f2 -> f4 -> f6`, `f3 -> f5 -> f6`, `f6 -> f7 -> f8`). Run it with profile mismatch enabled, fixed `branch_seed`, `timing_jitter_ms=800`, budgets `1 2 3`, and baselines `no_warmup`, `periodic_keepwarm`, `static_dag`, `orion_like`, `path_aware_greedy`, `oracle_path`, and `mint_markov_full`. This benchmark is intended to evaluate path uncertainty, profile mismatch, timing jitter, and budget-limited adaptive scheduling.
+Because fixed prewarming baselines can choose very similar warmup targets on the small standard DAGs, the paper core experiment should use the adaptive stress benchmark. It contains `wide_branch` (`f1 -> branch(f2/f3/f4/f5) -> f6 -> f7`) and `deep_mixed` (`f1 -> f2 or f3`, `f2 -> f4 -> f6`, `f3 -> f5 -> f6`, `f6 -> f7 -> f8`). Run it with profile mismatch enabled, fixed `branch_seed`, `timing_jitter_ms=800`, budgets `1 2 3`, and the five core rows `no_warmup`, `orion_full`, `faascache`, `xanadu_full`, `mint_markov_full`. This benchmark is intended to evaluate path uncertainty, profile mismatch, timing jitter, and budget-limited adaptive scheduling against the strongest academic remedies: full ORION (OSDI'22) container caching/bundling/right-sizing, FaasCache (ASPLOS'21) GDSF keep-alive, and Xanadu (Middleware'20) most-likely-path just-in-time provisioning.
 
-The final reported methods are `No warmup`, `Best-fixed`, `Path-aware greedy`, `MINT`, and `Oracle`. `Best-fixed` is not run as a separate controller baseline; it is computed in analysis by selecting the lowest-P95 row for each workload-budget pair among Periodic keep-warm, DAG-gain fixed, and Fixed look-ahead. `Path-aware greedy` is a simple online greedy baseline that uses the realized path and current hot/cold state, but not MINT's Markov policy. `Oracle` assumes advance knowledge of the realized path and is an ideal upper bound, not a deployable method or fair baseline. Fixed look-ahead follows the idea of DAG-aware right-prewarming, but the project does not claim to reproduce full ORION.
+The final reported methods are `MINT` (`mint_markov_full`), `ORION` (`orion_full`), `FaasCache` (`faascache`), `Xanadu` (`xanadu_full`), and the `No warmup` reference row. All five rows run under the same budget B (1/2/3), the same profile mismatch / timing jitter, the same seeds, and the same Azure-trace-calibrated parameters. `orion_full` reproduces ORION's container cache, right-sizing, and bundling at the scheduling layer (real AWS fidelity additionally requires per-memory deployments and composed functions). `faascache` reproduces the GDSF keep-alive cache at the scheduling layer with B proactive warmup slots. `xanadu_full` reproduces MLP detection plus just-in-time speculative provisioning at the scheduling layer. `provisioned_concurrency`, `Best-fixed`, `Path-aware greedy`, and `Oracle` remain appendix material only (Best-fixed is computed by the pre-registered rule "minimum P95 per (dag, budget) among periodic_keepwarm / static_dag / orion_like"; Oracle is an ideal upper bound, not a deployable method or fair baseline).
 
 Recommended adaptive stress dry-run:
 
@@ -41,9 +44,10 @@ Recommended adaptive stress dry-run:
 python scripts/run_experiment_matrix.py \
   --config configs/mint_aws.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
+  --baselines no_warmup orion_full faascache xanadu_full mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
+  --seeds 42 43 44 45 46 \
   --cooldown-sec 0 \
   --profile-mismatch \
   --timing-jitter-ms 800 \
@@ -59,9 +63,10 @@ Recommended EC2 real run:
 nohup python scripts/run_experiment_matrix.py \
   --config configs/mint_aws_real.yaml \
   --dags wide_branch deep_mixed \
-  --baselines no_warmup periodic_keepwarm static_dag orion_like path_aware_greedy oracle_path mint_markov_full \
+  --baselines no_warmup orion_full faascache xanadu_full mint_markov_full \
   --budgets 1 2 3 \
   --repetitions 10 \
+  --seeds 42 43 44 45 46 \
   --cooldown-sec 120 \
   --profile-mismatch \
   --timing-jitter-ms 800 \
@@ -71,6 +76,22 @@ nohup python scripts/run_experiment_matrix.py \
   --output-root results/aws_adaptive_stress_main \
   > adaptive_stress_main.log 2>&1 &
 ```
+
+Dynamic MINT budget note: the runtime intent-maintenance implementation keeps
+one immediate warmup slot plus a general multi-pending-intent queue, so
+`mint_markov_full` supports `warmup_budget` 1/2/3 on branch DAGs. The
+intent-maintenance ablations (`mint_markov_no_cancel`, `mint_markov_cancel_only`)
+remain defined only for B=2, and the `adaptive_branch` workload keeps its
+explicit B=2/initial=1 contract. The paper core matrix
+(wide_branch/deep_mixed x 5 rows x B=1/2/3) is expected to complete with
+zero skips; run `scripts/audit_adaptive_stress_results.py` (or pass `--audit`
+to the matrix runner) as the quality gate.
+
+Dry-run latency caveat: dry-run records simulated cold/warm latencies as event
+fields but does not sleep cold-start wall-clock time, so dry-run end-to-end
+latency is dominated by warmup overhead and should be used only as a pipeline
+check. Paper latency claims must use real AWS runs and measured wall-clock
+latency.
 
 The recommended AWS command is:
 
@@ -120,7 +141,33 @@ The tables summarize latency by DAG and baseline, warmup efficiency, scheduler a
 
 `periodic_keepwarm` represents a common industrial keep-warm strategy that ignores DAG structure, stage order, and branch/path information; it rotates through the function set under the same `warmup_budget`. `static_dag` is the fixed DAG-aware offline plan and does not perform runtime cancel, replace, or delay. `orion_like` represents a limited ORION-style DAG-aware right-prewarming approximation using stage order, expected start time, and fixed look-ahead prewarming. It intentionally excludes ORION right-sizing, bundling, and the full ORION optimizer, so results should be labeled ORION-like rather than a complete ORION reproduction.
 
+`faascache` (FaasCache, ASPLOS'21) is the Greedy-Dual-Size-Frequency keep-alive cache at the scheduling layer: B bounds the number of proactive warmup slots; values are `cost * freq / size + L`, where cost is the cold-start latency saved, freq is the (optionally decayed) invocation frequency, size is the container memory footprint, and L is the GDS aging factor equal to the last evicted value. Real invocations update frequency and populate the cache like accesses in the original system. `xanadu_full` (Xanadu, Middleware'20) derives the most-likely path from trace-calibrated and learned branch probabilities and spends the B slots on the earliest-needed MLP members first (JIT), never warming the entry function or off-MLP functions.
+
 When baseline results are close, use `scripts/analyze_baseline_overlap.py` to check target-set, frequency-vector, timing-bucket, and action-sequence overlap. High target-set overlap alone can be benign on tiny DAGs; high frequency and timing overlap as well means the workload may not distinguish the baselines. Use `scripts/prepare_pareto_data.py` to build cost-latency plot data, since MINT's benefit may appear as a Pareto tradeoff rather than a simple average-latency win. Pareto dominance uses `total_warmup` as cost and average latency or P95 latency as performance: a point is dominated only when another point has no more warmups and no worse latency, with at least one dimension strictly better.
+
+## Seed Statistics, Cost-Latency, and Trace Calibration
+
+The matrix runner stores one row per (dag, baseline, budget, seed).  Paper
+comparisons must not rely on a single seed: run
+`--seeds 42 43 44 45 46`, then
+`scripts/analyze_seed_statistics.py` produces per-config bootstrap means and
+95% CIs over seeds plus a pairwise MINT-vs-each-baseline P95 dominance
+probability.  `scripts/analyze_cost_latency.py` uses an explicit pricing model:
+warmup invocations cost `--invocation-price-usd` each; Provisioned Concurrency
+is billed on a separate axis (`provisioned_slots_total` x
+`provisioned_duration_sec_total` at `--provisioned-price-usd-per-slot-sec`).
+
+`Best-fixed` is the pre-registered deterministic rule "minimum P95 per
+(dag, budget) among periodic_keepwarm / static_dag / orion_like"; the three
+fixed baselines are also reported separately so no post-hoc cherry-picking is
+hidden.
+
+The synthetic workloads can be calibrated from the public Microsoft Azure
+Functions dataset (`scripts/download_azure_trace.py` + `mint/trace_profile.py`):
+branch probabilities come from observed call counts, stage spacing from
+inter-arrival time, warm duration from the duration median, and the cold-start
+model from observed memory.  The source is recorded in
+`experiment.trace_calibration.source` for reproducibility.
 
 The optional `mixed` workload adds branch choice plus downstream convergence (`f1 -> f2 or f3 -> f4 -> f5`). It is intended to stress branch, join, and downstream timing interaction while preserving the original four workloads for comparability.
 

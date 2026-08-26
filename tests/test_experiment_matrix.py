@@ -96,6 +96,135 @@ def test_experiment_matrix_records_failed_run_and_continues(tmp_path):
     assert failure["dag"] == "missing_dag"
 
 
+def test_experiment_matrix_runs_mint_markov_full_budget_three_on_wide_branch(tmp_path):
+    output_root = tmp_path / "matrix_b3"
+    rc = run_experiment_matrix.main(
+        [
+            "--config",
+            "configs/mint_aws.yaml",
+            "--dags",
+            "wide_branch",
+            "--baselines",
+            "mint_markov_full",
+            "no_warmup",
+            "--budgets",
+            "2",
+            "3",
+            "--repetitions",
+            "1",
+            "--dry-run",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+    assert rc == 0
+    rows = pd.read_csv(output_root / "summary_matrix.csv")
+    assert len(rows) == 4
+    assert set(rows["baseline"]) == {"mint_markov_full", "no_warmup"}
+    assert sorted(
+        rows.loc[rows["baseline"] == "mint_markov_full", "budget"].astype(int)
+    ) == [2, 3]
+    assert (output_root / "skipped_runs.jsonl").read_text(encoding="utf-8").strip() == ""
+    assert (output_root / "failed_runs.jsonl").read_text(encoding="utf-8").strip() == ""
+    manifest = json.loads((output_root / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["skipped_count"] == 0
+
+
+def test_experiment_matrix_skips_intent_maintenance_ablations_outside_budget_two(tmp_path):
+    output_root = tmp_path / "matrix_ablation_skip"
+    rc = run_experiment_matrix.main(
+        [
+            "--config",
+            "configs/mint_aws.yaml",
+            "--dags",
+            "wide_branch",
+            "--baselines",
+            "mint_markov_no_cancel",
+            "mint_markov_cancel_only",
+            "--budgets",
+            "2",
+            "3",
+            "--repetitions",
+            "1",
+            "--dry-run",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+    assert rc == 0
+    rows = pd.read_csv(output_root / "summary_matrix.csv")
+    assert len(rows) == 2
+    assert sorted(rows["budget"].astype(int).tolist()) == [2, 2]
+    skipped_lines = (
+        (output_root / "skipped_runs.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    )
+    assert len(skipped_lines) == 2
+    assert all(
+        json.loads(line)["budget"] == 3 and "warmup_budget=2" in json.loads(line)["reason"]
+        for line in skipped_lines
+    )
+    manifest = json.loads((output_root / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["skipped_count"] == 2
+
+
+def test_adaptive_stress_core_matrix_dry_run_completes_without_skip(tmp_path):
+    output_root = tmp_path / "matrix_adaptive_core"
+    rc = run_experiment_matrix.main(
+        [
+            "--config",
+            "configs/mint_aws.yaml",
+            "--dags",
+            "wide_branch",
+            "deep_mixed",
+            "--baselines",
+            "no_warmup",
+            "orion_full",
+            "faascache",
+            "xanadu_full",
+            "mint_markov_full",
+            "--budgets",
+            "1",
+            "2",
+            "3",
+            "--repetitions",
+            "1",
+            "--cooldown-sec",
+            "0",
+            "--profile-mismatch",
+            "--timing-jitter-ms",
+            "800",
+            "--branch-seed",
+            "42",
+            "--randomize-order",
+            "--dry-run",
+            "--output-root",
+            str(output_root),
+        ]
+    )
+    assert rc == 0
+    rows = pd.read_csv(output_root / "summary_matrix.csv")
+    assert len(rows) == 30
+    assert set(rows["dag"]) == {"wide_branch", "deep_mixed"}
+    assert set(rows["baseline"]) == {
+        "no_warmup",
+        "orion_full",
+        "faascache",
+        "xanadu_full",
+        "mint_markov_full",
+    }
+    assert sorted(rows["budget"].astype(int).unique()) == [1, 2, 3]
+    assert (output_root / "skipped_runs.jsonl").read_text(encoding="utf-8").strip() == ""
+    assert (output_root / "failed_runs.jsonl").read_text(encoding="utf-8").strip() == ""
+    manifest = json.loads((output_root / "experiment_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["skipped_count"] == 0
+    assert manifest["profile_mismatch"] is True
+    assert float(manifest["timing_jitter_ms"]) == 800.0
+    assert manifest["branch_seed"] == 42
+    assert manifest["randomize_order"] is True
+    mint = rows[rows["baseline"] == "mint_markov_full"]
+    assert sorted(mint["budget"].astype(int).tolist()) == sorted([1, 2, 3] * 2)
+
+
 def test_experiment_matrix_defaults_to_dry_run_without_confirm(tmp_path):
     output_root = tmp_path / "matrix_safe"
     rc = run_experiment_matrix.main(

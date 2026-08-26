@@ -33,6 +33,7 @@ SUMMARY_FIELDS = [
     "effective_planner",
     "budget",
     "repetitions",
+    "seed",
     "output_dir",
     "workflow_runs",
     "aborted_run_count",
@@ -40,6 +41,8 @@ SUMMARY_FIELDS = [
     "reserved_budget_final_total",
     "unused_budget_total",
     "budget_limit_per_run",
+    "provisioned_slots_total",
+    "provisioned_duration_sec_total",
     "end_to_end_latency_ms_avg",
     "p50_latency_ms",
     "p95_latency_ms",
@@ -101,10 +104,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--baselines",
         nargs="+",
-        default=["no_warmup", "periodic_keepwarm", "static_dag", "orion_like", "mint_offline", "mint_full"],
+        default=["no_warmup", "orion_full", "faascache", "xanadu_full", "mint_markov_full"],
     )
     parser.add_argument("--budgets", nargs="+", type=int, default=[1, 2, 3])
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit branch seeds; defaults to [--branch-seed]. Paper runs should pass multiple seeds, e.g. --seeds 42 43 44 45 46.",
+    )
     parser.add_argument("--cooldown-sec", type=float, default=0.0)
     parser.add_argument("--profile-mismatch", action="store_true", help="Enable controlled branch-profile mismatch for adaptive stress DAGs.")
     parser.add_argument("--timing-jitter-ms", type=float, default=0.0, help="Controlled per-stage timing jitter for adaptive stress DAGs.")
@@ -113,6 +123,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--order-seed", type=int, default=0, help="Seed used only to randomize matrix configuration order.")
     parser.add_argument("--dry-run", action="store_true", help="Never call AWS; enabled by default unless --confirm-real-run is used.")
     parser.add_argument("--confirm-real-run", action="store_true", help="Required to allow real AWS Lambda invocation.")
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run the adaptive stress audit/quality gate on the completed matrix.",
+    )
     parser.add_argument("--output-root", default="results/matrix")
     return parser.parse_args(argv)
 
@@ -132,9 +147,13 @@ def effective_planner_for_baseline(baseline: str) -> str:
         "static_dag": "static",
         "static_dag_unlimited": "static",
         "orion_like": "orion_like",
+        "orion_full": "orion_full",
+        "faascache": "faascache",
+        "xanadu_full": "xanadu_full",
         "path_aware_greedy": "runtime_greedy",
         "xanadu_like": "xanadu_like",
         "oracle_path": "oracle",
+        "provisioned_concurrency": "provisioned",
         "mint_offline": "heuristic",
         "mint_offline_unlimited": "heuristic",
         "mint_full": "heuristic",
@@ -194,18 +213,59 @@ def _adaptive_branch_trace(config: dict[str, Any], repetitions: int, seed: int) 
     return trace
 
 
+def unsupported_combo_reason(
+    dag_name: str,
+    baseline: str,
+    budget: int,
+    config: dict[str, Any],
+) -> str | None:
+    """Return a stable reason when a (dag, baseline, budget) combination is
+    outside the current implementation's supported range, or None to run it.
+
+    The runtime intent-maintenance design keeps one immediate slot plus a
+    general pending queue, so `mint_markov_full` runs at any budget the
+    workload can support.  Only the intent-maintenance ablations that are
+    defined for exactly B=2, and the `adaptive_branch` workload's explicit
+    B=2/initial=1 contract, remain unsupported elsewhere.  Skipping here
+    (instead of failing in the controller) lets a documented matrix complete
+    while recording exactly which cells are unsupported.
+    """
+    try:
+        dag = get_workload(dag_name)
+    except ValueError:
+        # Unknown DAGs are handled by the existing per-config failure path.
+        return None
+    exp_cfg = config.get("experiment", {})
+    if baseline in {"mint_markov_no_cancel", "mint_markov_cancel_only"} and budget != 2:
+        return (
+            f"{baseline} is an intent-maintenance ablation defined only for "
+            f"warmup_budget=2; got {budget}"
+        )
+    if baseline in {"mint_markov_no_cancel", "mint_markov_cancel_only", "mint_markov_full"} and dag.branch_rules:
+        if dag_name == "adaptive_branch":
+            total = int(exp_cfg.get("warmup_budget", budget))
+            initial = int(exp_cfg.get("adaptive_initial_warmup_budget", 1))
+            if total != 2 or initial != 1:
+                return (
+                    "adaptive_branch intent-maintenance experiments require "
+                    f"warmup_budget=2 and adaptive_initial_warmup_budget=1; "
+                    f"got budget={total}, initial={initial}"
+                )
+    return None
+
+
 def _run_one(
     base_config: dict[str, Any],
     dag_name: str,
     baseline: str,
     budget: int,
     repetitions: int,
+    seed: int,
     dry_run: bool,
     output_root: Path,
     timestamp: str,
     profile_mismatch: bool = False,
     timing_jitter_ms: float = 0.0,
-    branch_seed: int = 0,
     branch_trace: list[str] | None = None,
 ) -> dict[str, Any]:
     config = copy.deepcopy(base_config)
@@ -214,15 +274,15 @@ def _run_one(
     exp["baseline"] = baseline
     exp["warmup_budget"] = budget
     exp["repetitions"] = repetitions
+    exp["branch_seed"] = seed
     exp["dry_run"] = dry_run
     exp["profile_mismatch"] = profile_mismatch
     exp["timing_jitter_ms"] = timing_jitter_ms
-    exp["branch_seed"] = branch_seed
     if branch_trace is not None:
         exp["branch_trace"] = list(branch_trace)
 
     run_stamp = _utc_timestamp()
-    output_dir = output_root / f"{run_stamp}_{_safe_name(dag_name)}_{_safe_name(baseline)}_B{budget}"
+    output_dir = output_root / f"{run_stamp}_{_safe_name(dag_name)}_{_safe_name(baseline)}_B{budget}_S{seed}"
     exp["output_dir"] = str(output_dir)
 
     print(f"START dag={dag_name} baseline={baseline} budget={budget} repetitions={repetitions} dry_run={dry_run}")
@@ -245,6 +305,7 @@ def _run_one(
         "effective_planner": effective_planner_for_baseline(baseline),
         "budget": budget,
         "repetitions": repetitions,
+        "seed": seed,
         "output_dir": str(output_dir),
     }
     row.update(summary)
@@ -261,6 +322,7 @@ def main(argv: list[str] | None = None) -> int:
 
     output_root = ensure_dir(args.output_root)
     failed_path = output_root / "failed_runs.jsonl"
+    skipped_path = output_root / "skipped_runs.jsonl"
 
     base_config = load_yaml(args.config)
     initial_history = _materialize_initial_history(base_config)
@@ -269,17 +331,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.branch_seed is not None
         else base_config.get("experiment", {}).get("branch_seed", 0)
     )
+    seeds = list(args.seeds) if args.seeds else [resolved_branch_seed]
     planner_cfg = base_config.get("planner", {})
     history_fingerprint = hashlib.sha256(
         json.dumps(initial_history, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
     timestamp = _utc_timestamp()
-    configs = list(itertools.product(args.dags, args.baselines, args.budgets))
+    configs = list(
+        itertools.product(args.dags, args.baselines, args.budgets, seeds)
+    )
     if args.randomize_order:
         random.Random(args.order_seed).shuffle(configs)
     traces = {
-        dag_name: _adaptive_branch_trace(base_config, args.repetitions, resolved_branch_seed)
+        f"{dag_name}:{seed}": _adaptive_branch_trace(base_config, args.repetitions, seed)
         for dag_name in args.dags
+        for seed in seeds
         if dag_name == "adaptive_branch"
     }
 
@@ -290,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         "baselines": args.baselines,
         "budgets": args.budgets,
         "repetitions": args.repetitions,
+        "seeds": seeds,
         "cooldown_sec": args.cooldown_sec,
         "profile_mismatch": args.profile_mismatch,
         "timing_jitter_ms": args.timing_jitter_ms,
@@ -308,8 +375,8 @@ def main(argv: list[str] | None = None) -> int:
         "branch_prior_alpha": planner_cfg.get("branch_prior_alpha", 0.0),
         "materialized_branch_traces": traces,
         "branch_trace_sha256": {
-            dag_name: hashlib.sha256(json.dumps(trace, separators=(",", ":")).encode("utf-8")).hexdigest()
-            for dag_name, trace in traces.items()
+            key: hashlib.sha256(json.dumps(trace, separators=(",", ":")).encode("utf-8")).hexdigest()
+            for key, trace in traces.items()
         },
     }
     resolved_snapshot = {
@@ -320,6 +387,7 @@ def main(argv: list[str] | None = None) -> int:
             "baselines": list(args.baselines),
             "budgets": list(args.budgets),
             "repetitions": args.repetitions,
+            "seeds": seeds,
             "cooldown_sec": args.cooldown_sec,
             "profile_mismatch": args.profile_mismatch,
             "timing_jitter_ms": args.timing_jitter_ms,
@@ -338,10 +406,27 @@ def main(argv: list[str] | None = None) -> int:
         repository=ROOT,
     )
     failed_path.write_text("", encoding="utf-8")
+    skipped_path.write_text("", encoding="utf-8")
     rows: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     _write_matrix_outputs(output_root, rows, manifest)
 
-    for index, (dag_name, baseline, budget) in enumerate(configs):
+    for index, (dag_name, baseline, budget, seed) in enumerate(configs):
+        skip_reason = unsupported_combo_reason(dag_name, baseline, budget, base_config)
+        if skip_reason is not None:
+            skipped_record = {
+                "timestamp": _utc_timestamp(),
+                "dag": dag_name,
+                "baseline": baseline,
+                "budget": budget,
+                "repetitions": args.repetitions,
+                "seed": seed,
+                "reason": skip_reason,
+            }
+            skipped.append(skipped_record)
+            append_jsonl(skipped_path, skipped_record)
+            print(f"SKIP dag={dag_name} baseline={baseline} budget={budget} reason={skip_reason}")
+            continue
         try:
             row = _run_one(
                 base_config,
@@ -349,13 +434,13 @@ def main(argv: list[str] | None = None) -> int:
                 baseline,
                 budget,
                 args.repetitions,
+                seed,
                 dry_run,
                 output_root,
                 timestamp,
                 args.profile_mismatch,
                 args.timing_jitter_ms,
-                resolved_branch_seed,
-                traces.get(dag_name),
+                traces.get(f"{dag_name}:{seed}"),
             )
             rows.append(row)
             _write_matrix_outputs(output_root, rows, manifest)
@@ -366,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                 "baseline": baseline,
                 "budget": budget,
                 "repetitions": args.repetitions,
+                "seed": seed,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
             }
@@ -375,11 +461,28 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Cooling down for {args.cooldown_sec} sec")
             time.sleep(args.cooldown_sec)
 
+    manifest["skipped_count"] = len(skipped)
+    manifest["skipped_configs"] = skipped
     _write_matrix_outputs(output_root, rows, manifest)
     print(f"Wrote {output_root / 'summary_matrix.csv'}")
     print(f"Wrote {output_root / 'summary_matrix.json'}")
     print(f"Wrote {failed_path}")
+    print(f"Wrote {skipped_path}")
     print(f"Wrote {output_root / 'experiment_manifest.json'}")
+    if args.audit:
+        from scripts.audit_adaptive_stress_results import audit_adaptive_stress, write_report
+
+        report = audit_adaptive_stress(
+            output_root,
+            repetitions=args.repetitions,
+            seeds=seeds,
+        )
+        report_paths = write_report(report, output_root / "audit")
+        print(f"Audit OK: {report['ok']}")
+        print(f"Audit errors: {report['error_count']}")
+        print(f"Wrote {report_paths[0]}")
+        if not report["ok"]:
+            return 1
     return 0
 
 

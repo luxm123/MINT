@@ -137,6 +137,11 @@ def compute_summary(events_path: str | Path) -> dict[str, Any]:
         "consumed_budget_total": sum(int(event.get("consumed_budget", event.get("warmup_count", 0))) for event in summary_events),
         "reserved_budget_final_total": sum(int(event.get("reserved_budget", 0)) for event in summary_events),
         "unused_budget_total": sum(int(event.get("unused_budget", 0)) for event in summary_events),
+        "provisioned_slots_total": sum(int(event.get("provisioned_slots", 0)) for event in summary_events),
+        "provisioned_duration_sec_total": round(
+            sum(float(event.get("provisioned_duration_sec", 0.0)) for event in summary_events),
+            6,
+        ),
         "warmup_error_total": sum(
             int(event.get("warmup_error_count", 0)) for event in summary_events
         ),

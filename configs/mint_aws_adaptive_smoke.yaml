@@ -1,0 +1,74 @@
+aws:
+  region: us-east-1
+  lambda_functions:
+    f1: mint-f1
+    f2: mint-f2
+    f3: mint-f3
+    f4: mint-f4
+    f5: mint-f5
+    f6: mint-f6
+    f7: mint-f7
+    f8: mint-f8
+    f9: mint-f9
+  lambda_function_pools:
+    no_warmup_pool:
+      f1: mint-nowarm-f1
+      f2: mint-nowarm-f2
+      f3: mint-nowarm-f3
+      f4: mint-nowarm-f4
+      f5: mint-nowarm-f5
+      f6: mint-nowarm-f6
+      f7: mint-nowarm-f7
+      f8: mint-nowarm-f8
+      f9: mint-nowarm-f9
+    mint_full_pool:
+      f1: mint-full-f1
+      f2: mint-full-f2
+      f3: mint-full-f3
+      f4: mint-full-f4
+      f5: mint-full-f5
+      f6: mint-full-f6
+      f7: mint-full-f7
+      f8: mint-full-f8
+      f9: mint-full-f9
+
+experiment:
+  dag: adaptive_branch
+  baseline: mint_markov_full
+  repetitions: 2
+  warmup_budget: 2
+  adaptive_initial_warmup_budget: 1
+  exclude_entry_nodes_from_warmup: true
+  dry_run: false
+  output_dir: results/aws_adaptive_smoke
+  branch_seed: 20260804
+  branch_probability_phases:
+    - start: 0
+      end: 1
+      probabilities: {f2: 0.8, f3: 0.0666667, f4: 0.0666667, f5: 0.0666666}
+    - start: 1
+      end: 2
+      probabilities: {f2: 0.0666667, f3: 0.0666667, f4: 0.0666666, f5: 0.8}
+
+planner:
+  type: markov
+  horizon: 5
+  warmup_cost: 0.1
+  cold_start_penalty_weight: 1.0
+  wasted_warmup_penalty_weight: 0.2
+  missed_warmup_penalty_weight: 0.5
+  retention_bucket_sec: 60
+  branch_prior_alpha: 0.0
+  branch_history_window: 10
+  historical_branch_records: [f2, f2, f2, f2, f2, f2, f2, f3, f4, f5]
+
+platform:
+  default_retention_sec: 300
+  default_cold_start_ms: 800
+  default_warm_duration_ms: 100
+
+scheduler:
+  enable_delay: true
+  enable_cancel: true
+  enable_replace: true
+  gain_threshold: 0.0

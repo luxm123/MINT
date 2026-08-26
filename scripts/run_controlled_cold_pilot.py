@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import hashlib
 import json
 import sys
 import time
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from mint.controller import MintController
+from mint.provenance import write_experiment_provenance
 from mint.utils import ensure_dir, load_yaml, monotonic_sec, read_jsonl
 from mint.workloads import get_workload
 from scripts.run_paired_pilot import balanced_orders
@@ -35,6 +37,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--post-reset-delay-sec", type=float, default=3.0)
     parser.add_argument("--warmup-lead-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--adaptive-pending-delay-sec",
+        type=float,
+        help=(
+            "Required for real dynamic MINT runs. Must come from a separate f1 "
+            "latency calibration and exceed the branch-reveal window."
+        ),
+    )
     parser.add_argument("--profile-mismatch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-real-run", action="store_true")
@@ -170,6 +180,22 @@ def main() -> int:
     output_root = ensure_dir(args.output_root)
     base_config = load_yaml(args.config)
     dag = get_workload(args.dag)
+    dynamic_mint = bool(dag.branch_rules) and any(
+        baseline in {
+            "mint_markov_no_cancel",
+            "mint_markov_cancel_only",
+            "mint_markov_full",
+        }
+        for baseline in args.baselines
+    )
+    if not dry_run and dynamic_mint:
+        if args.adaptive_pending_delay_sec is None:
+            raise SystemExit(
+                "Real dynamic MINT smoke requires --adaptive-pending-delay-sec "
+                "from a separate f1 calibration"
+            )
+        if args.adaptive_pending_delay_sec <= 0:
+            raise SystemExit("--adaptive-pending-delay-sec must be positive")
     lambda_client = None
     if not dry_run:
         import boto3
@@ -194,6 +220,8 @@ def main() -> int:
                 "dry_run": dry_run,
             }
         )
+        if dynamic_mint and args.adaptive_pending_delay_sec is not None:
+            exp["adaptive_pending_delay_sec"] = args.adaptive_pending_delay_sec
         controllers[baseline] = MintController(
             config,
             dag=dag,
@@ -206,6 +234,14 @@ def main() -> int:
     reset_rows: list[dict[str, Any]] = []
     validation_rows: list[dict[str, Any]] = []
     orders = balanced_orders(args.baselines, args.blocks, args.seed)
+    realized_trace = [
+        str(controllers[args.baselines[0]]._run_context(index).get("branch", ""))
+        for index in range(args.blocks)
+    ]
+    for controller in controllers.values():
+        controller.config.setdefault("experiment", {})["branch_trace"] = list(
+            realized_trace
+        )
     for block_index, order in enumerate(orders):
         block_id = f"block-{block_index:04d}"
         order_text = ",".join(order)
@@ -290,10 +326,52 @@ def main() -> int:
         "seed": args.seed,
         "post_reset_delay_sec": args.post_reset_delay_sec,
         "warmup_lead_sec": args.warmup_lead_sec,
+        "adaptive_pending_delay_sec": args.adaptive_pending_delay_sec,
+        "pending_delay_source": (
+            "explicit_cli_calibration" if args.adaptive_pending_delay_sec is not None else None
+        ),
+        "realized_strategy_orders": orders,
+        "materialized_branch_trace": realized_trace,
+        "branch_trace_sha256": hashlib.sha256(
+            json.dumps(realized_trace, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
         "profile_mismatch": args.profile_mismatch,
         "dry_run": dry_run,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
+    resolved_snapshot = {
+        "source_config_path": str(Path(args.config).resolve()),
+        "base_config": base_config,
+        "strategy_configs": {
+            baseline: controller.config for baseline, controller in controllers.items()
+        },
+        "pilot": {
+            key: manifest[key]
+            for key in (
+                "mode",
+                "dag",
+                "baselines",
+                "pools",
+                "blocks",
+                "budget",
+                "seed",
+                "post_reset_delay_sec",
+                "warmup_lead_sec",
+                "adaptive_pending_delay_sec",
+                "pending_delay_source",
+                "realized_strategy_orders",
+                "materialized_branch_trace",
+                "branch_trace_sha256",
+                "profile_mismatch",
+                "dry_run",
+            )
+        },
+    }
+    manifest["provenance"] = write_experiment_provenance(
+        output_root,
+        resolved_snapshot,
+        repository=ROOT,
+    )
     (output_root / "experiment_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True),
         encoding="utf-8",

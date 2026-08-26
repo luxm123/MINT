@@ -39,7 +39,7 @@ def test_paired_strategy_report_enforces_trace_history_and_budget(tmp_path):
     manifest = json.loads((output_root / "experiment_manifest.json").read_text(encoding="utf-8"))
     assert manifest["branch_seed"] == 20260804
     assert manifest["initial_history_size"] == 10
-    assert len(manifest["materialized_branch_traces"]["adaptive_branch"]) == 4
+    assert len(manifest["materialized_branch_traces"]["adaptive_branch:20260804"]) == 4
     rows = list(csv.DictReader((output_root / "summary_matrix.csv").open(newline="", encoding="utf-8")))
     assert next(row for row in rows if row["baseline"] == "xanadu_like")["effective_planner"] == "xanadu_like"
     for row in rows:

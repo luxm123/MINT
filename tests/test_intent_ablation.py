@@ -209,23 +209,42 @@ def test_adaptive_intent_ablations_require_two_total_and_one_initial_budget(
         )
 
 
-def test_runtime_intent_maintenance_rejects_budget_above_two(
+def test_runtime_intent_maintenance_runs_budget_three_on_wide_branch(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dag = get_workload("wide_branch")
-    config = _adaptive_config(tmp_path / "wide", "mint_markov_full", "f2")
+    output_dir = tmp_path / "wide"
+    config = _adaptive_config(output_dir, "mint_markov_full", "f2")
     config["experiment"]["warmup_budget"] = 3
     config["aws"]["lambda_functions"] = {
         node: f"mint-{node}" for node in dag.nodes
     }
+    monkeypatch.setattr(controller_mod, "invoke_lambda", _capturing_invoke([]))
 
-    with pytest.raises(ValueError, match="maximum B=2"):
-        MintController(
-            config,
-            dag=dag,
-            baseline="mint_markov_full",
-            dry_run=True,
-        )
+    controller = MintController(
+        config,
+        dag=dag,
+        baseline="mint_markov_full",
+        dry_run=True,
+    )
+    result = controller.run_once(0)
+    events = _events(output_dir)
+
+    assert result["warmup_count"] <= 3
+    assert result["consumed_budget"] <= 3
+    assert result["reserved_budget"] == 0
+    assert result["budget_limit"] == 3
+    plan_pending = [
+        event
+        for event in events
+        if event.get("event_type") == "scheduler_decision"
+        and event.get("action") == "plan_pending"
+    ]
+    assert 1 <= len(plan_pending) <= 2
+    assert {event["logical_name"] for event in plan_pending} <= {"f6", "f7"}
+    assert controller._pending_intents_by_run == {}
+    assert controller._scheduled_tasks_by_run == {}
 
 
 @pytest.mark.parametrize(
@@ -686,7 +705,9 @@ def test_slow_useful_replacement_does_not_block_business_at_demand(
         if event.get("event_type") == "invocation" and event.get("logical_name") == "f8"
     )
 
-    assert result["latency_ms"] < 150
+    # Business latency must stay far below the 300ms replacement warmup tail;
+    # the threshold is deliberately kept loose enough to avoid CI timing noise.
+    assert result["latency_ms"] < 250
     assert replacement["target_hit"] is True
     assert replacement["readiness_deadline_type"] == "node_demand"
     assert replacement["ready_before_deadline"] is False

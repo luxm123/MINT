@@ -129,6 +129,8 @@ class WorkflowRunSummary(EventBase):
     latency_ms: float = 0.0
     cold_start_count: int = 0
     warmup_count: int = 0
+    provisioned_slots: int = 0
+    provisioned_duration_sec: float = 0.0
     reserved_budget: int = 0
     consumed_budget: int = 0
     budget_limit: int = 0
