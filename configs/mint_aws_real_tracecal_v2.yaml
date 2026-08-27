@@ -1,0 +1,93 @@
+# Real AWS Lambda experiment configuration (trace-calibrated v2).
+#
+# v2 fixes the cost-model mismatch found in the 2026-08-26/27 core matrix:
+#   * default_warm_duration_ms was 8586.5 (Azure trace median function
+#     duration) but the controlled AWS microbenchmark warms in ~90 ms.
+#     Measured from the real matrix events: warmup latency mean 90.0 ms
+#     (p50 64.8 ms, p95 293.7 ms).
+#   * default_cold_start_ms is set from the measured demand cold-vs-warm
+#     latency difference: cold mean 507.1 ms vs warm mean 193.8 ms
+#     => 313.3 ms penalty (p50-based diff 610.2 ms).
+# Branch probabilities come from the Azure trace calibration used by the
+# 2026-08-26/27 run (see experiment.trace_calibration below).
+#
+# Safety: never store AWS access keys, secret keys, session tokens or local
+# credential files in this repository.  Use the normal AWS credential chain or
+# an EC2 instance role.  Real AWS runs still require --confirm-real-run.
+
+aws:
+  region: us-east-1
+  lambda_functions:
+    f1: mint-f1
+    f2: mint-f2
+    f3: mint-f3
+    f4: mint-f4
+    f5: mint-f5
+    f6: mint-f6
+    f7: mint-f7
+    f8: mint-f8
+
+experiment:
+  dag: wide_branch
+  baseline: mint_markov_full
+  repetitions: 10
+  warmup_budget: 2
+  dry_run: false
+  output_dir: results/aws_real
+  branch_seed: 42
+  stage_gap_sec: 0.05
+  trace_calibration:
+    source: /home/ubuntu/MINT/data/azure_trace/invocations_per_function_md.anon.d01.csv
+    branch_mapping: rank_fallback_by_call_count
+    branch_probabilities:
+      deep_mixed:
+        f1:
+          f2: 0.6039514056139978
+          f3: 0.39604859438600215
+      wide_branch:
+        f1:
+          f2: 0.4488083284148271
+          f3: 0.2943116051476307
+          f4: 0.17233780326483092
+          f5: 0.0845422631727112
+
+planner:
+  type: markov
+  horizon: 5
+  warmup_cost: 0.1
+  cold_start_penalty_weight: 1.0
+  wasted_warmup_penalty_weight: 0.2
+  missed_warmup_penalty_weight: 0.5
+  retention_bucket_sec: 60
+  branch_probability_left: 0.6039514056139978
+  branch_probabilities:
+    f2: 0.4488083284148271
+    f3: 0.2943116051476307
+    f4: 0.17233780326483092
+    f5: 0.0845422631727112
+
+platform:
+  retention_probe_delays_sec: [30, 60, 120, 180, 300, 600]
+  default_retention_sec: 300
+  # Measured from the 2026-08-26/27 real core matrix demand invocations:
+  # cold-start penalty (cold mean - warm mean) = 313.3 ms.
+  default_cold_start_ms: 315
+  # Measured warmup invocation latency mean = 90.0 ms.
+  default_warm_duration_ms: 100
+
+baseline:
+  # FaasCache (ASPLOS'21) GDSF parameters.  frequency_decay 0.0 keeps the
+  # classic cumulative-count semantics; set a positive value for a
+  # recency-weighted sliding-window estimate.  size_mb/cold_start_ms per
+  # function default to uniform values when omitted.
+  faascache:
+    frequency_decay: 0.0
+  # Xanadu (Middleware'20) MLP/JIT prewarming uses the trace-calibrated and
+  # learned branch probabilities; no additional parameters are required.
+  xanadu_full: {}
+
+scheduler:
+  enable_delay: true
+  enable_cancel: true
+  enable_replace: true
+  gain_threshold: 0.0
